@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, Context, Result};
 use aws_credential_types::Credentials;
 use aws_sdk_s3::config::Region;
+use aws_sdk_s3::operation::get_object::GetObjectError;
+use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{Delete, ObjectIdentifier};
 use aws_sdk_s3::Client;
@@ -254,21 +256,31 @@ async fn run_worker(
         let key_idx = rng.gen_range(0..cfg.seed_objects.max(1));
         let key = format!("obj{key_idx}");
         let start = Instant::now();
-        let outcome: Result<u64> = match op {
-            Op::Get => do_get(&client, &cfg.bucket, &key, cfg.timeout).await,
+        let outcome: Result<(&'static str, u64)> = match op {
+            Op::Get => match do_get(&client, &cfg.bucket, &key, cfg.timeout).await {
+                Ok(Outcome::Hit(n)) => Ok(("GET", n)),
+                Ok(Outcome::Miss) => Ok(("GET_404", 0)),
+                Err(e) => Err(e),
+            },
             Op::Put => do_put(&client, &cfg.bucket, &key, payload.clone(), cfg.timeout)
                 .await
-                .map(|_| payload.len() as u64),
-            Op::Stat => do_stat(&client, &cfg.bucket, &key, cfg.timeout).await.map(|_| 0),
-            Op::Delete => do_delete(&client, &cfg.bucket, &key, cfg.timeout).await.map(|_| 0),
+                .map(|_| ("PUT", payload.len() as u64)),
+            Op::Stat => match do_stat(&client, &cfg.bucket, &key, cfg.timeout).await {
+                Ok(Outcome::Hit(_)) => Ok(("STAT", 0)),
+                Ok(Outcome::Miss) => Ok(("STAT_404", 0)),
+                Err(e) => Err(e),
+            },
+            Op::Delete => do_delete(&client, &cfg.bucket, &key, cfg.timeout)
+                .await
+                .map(|_| ("DELETE", 0)),
         };
         let us = start.elapsed().as_micros() as u64;
         if !measuring {
             continue;
         }
         match outcome {
-            Ok(bytes) => {
-                report.record_op(op.label(), us);
+            Ok((label, bytes)) => {
+                report.record_op(label, us);
                 h.live.requests.fetch_add(1, Ordering::Relaxed);
                 h.live.bytes.fetch_add(bytes, Ordering::Relaxed);
                 h.live.record_request_phases(us, 0);
@@ -287,18 +299,35 @@ fn short_err(e: &anyhow::Error) -> String {
     s.lines().next().unwrap_or("error").to_string()
 }
 
-async fn do_get(client: &Client, bucket: &str, key: &str, timeout: Duration) -> Result<u64> {
+/// Result of a GET / STAT in mixed mode where keys come and go.
+/// `Hit(bytes)` is a real read; `Miss` is a 404 from a DELETE earlier in
+/// the run — still a valid response from the server, just not an error.
+enum Outcome {
+    Hit(u64),
+    Miss,
+}
+
+async fn do_get(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    timeout: Duration,
+) -> Result<Outcome> {
     let resp = match tokio::time::timeout(
         timeout,
         client.get_object().bucket(bucket).key(key).send(),
     )
     .await
     {
-        Ok(r) => r.context("GET")?,
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => match e.into_service_error() {
+            GetObjectError::NoSuchKey(_) => return Ok(Outcome::Miss),
+            other => return Err(anyhow::Error::new(other).context("GET")),
+        },
         Err(_) => return Err(anyhow!("timeout")),
     };
     let body = resp.body.collect().await.context("GET body")?;
-    Ok(body.into_bytes().len() as u64)
+    Ok(Outcome::Hit(body.into_bytes().len() as u64))
 }
 
 async fn do_put(
@@ -327,24 +356,18 @@ async fn do_put(
     }
 }
 
-async fn do_stat(client: &Client, bucket: &str, key: &str, timeout: Duration) -> Result<()> {
+async fn do_stat(client: &Client, bucket: &str, key: &str, timeout: Duration) -> Result<Outcome> {
     match tokio::time::timeout(
         timeout,
         client.head_object().bucket(bucket).key(key).send(),
     )
     .await
     {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(e)) => {
-            // 404 from a Mixed workload is expected (DELETEd object); count
-            // it as success for STAT to avoid swamping the error map.
-            let s = e.to_string();
-            if s.contains("404") || s.contains("NotFound") {
-                Ok(())
-            } else {
-                Err(anyhow::Error::new(e))
-            }
-        }
+        Ok(Ok(_)) => Ok(Outcome::Hit(0)),
+        Ok(Err(e)) => match e.into_service_error() {
+            HeadObjectError::NotFound(_) => Ok(Outcome::Miss),
+            other => Err(anyhow::Error::new(other).context("STAT")),
+        },
         Err(_) => Err(anyhow!("timeout")),
     }
 }

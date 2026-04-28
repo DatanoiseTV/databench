@@ -28,6 +28,7 @@ mod ping_bench;
 mod postgres_bench;
 mod ratelimit;
 mod redis_bench;
+mod s3_bench;
 mod stats;
 mod tcp_bench;
 mod tls;
@@ -105,6 +106,8 @@ enum Cmd {
     Memcache(McArgs),
     /// MySQL/MariaDB benchmark (sysbench OLTP-shaped).
     Mysql(MyArgs),
+    /// S3 / MinIO object-store benchmark (warp-shaped workloads).
+    S3(S3Args),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -197,6 +200,42 @@ struct RedisArgs {
     /// against an existing dataset.
     #[arg(long = "no-sandbox")]
     no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct S3Args {
+    /// Endpoint URL — e.g. http://127.0.0.1:9000 (MinIO local) or
+    /// https://s3.amazonaws.com.
+    endpoint: String,
+    /// Region. MinIO accepts anything; defaults to us-east-1.
+    #[arg(long = "region", default_value = "us-east-1")]
+    region: String,
+    /// Access key. MinIO default is `minioadmin`.
+    #[arg(long = "access-key", default_value = "minioadmin", env = "DATABENCH_S3_ACCESS_KEY", hide_env_values = true)]
+    access_key: String,
+    /// Secret key. MinIO default is `minioadmin`.
+    #[arg(long = "secret-key", default_value = "minioadmin", env = "DATABENCH_S3_SECRET_KEY", hide_env_values = true)]
+    secret_key: String,
+    /// Workload preset: read | mixed (default, warp shape) | write | stat.
+    /// `mixed` = 45% GET / 30% STAT / 15% PUT / 10% DELETE.
+    #[arg(long = "workload", default_value = "mixed")]
+    workload: String,
+    /// Object size in bytes. 64 KiB by default — small enough for fast
+    /// seeding, big enough to be a real payload. Bump to 10485760 (10 MB)
+    /// to mirror warp's defaults.
+    #[arg(long = "object-size", default_value_t = 65_536)]
+    object_size: usize,
+    /// Number of objects to seed.
+    #[arg(long = "seed-objects", default_value_t = 1_000)]
+    seed_objects: usize,
+    /// Skip sandbox; use --bucket on existing data.
+    #[arg(long = "no-sandbox")]
+    no_sandbox: bool,
+    /// Bucket override. With --no-sandbox, this is the bucket worked on.
+    /// Without, it's used as the literal bucket name (databench refuses to
+    /// auto-clean any bucket whose name doesn't start with `databench-`).
+    #[arg(long = "bucket")]
+    bucket: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -323,6 +362,10 @@ enum Cleanup {
     Postgres(postgres_bench::SandboxInfo),
     Memcache(memcache_bench::McConfig),
     Mysql(mysql_bench::SandboxInfo),
+    S3 {
+        client: aws_sdk_s3::Client,
+        bucket: String,
+    },
 }
 
 impl Cleanup {
@@ -372,6 +415,11 @@ impl Cleanup {
                 if matches!(info.kind, mysql_bench::SandboxKind::Database) {
                     eprintln!("databench: dropped database `{}`", info.db);
                 }
+                Ok(())
+            }
+            Cleanup::S3 { client, bucket } => {
+                let n = s3_bench::cleanup(&client, &bucket).await?;
+                eprintln!("databench: deleted {n} S3 objects + bucket `{bucket}`");
                 Ok(())
             }
         }
@@ -481,6 +529,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         Cmd::Postgres(args) => spawn_postgres(&cli, args, h.clone()).await?,
         Cmd::Memcache(args) => spawn_memcache(&cli, args, h.clone()).await?,
         Cmd::Mysql(args) => spawn_mysql(&cli, args, h.clone()).await?,
+        Cmd::S3(args) => spawn_s3(&cli, args, h.clone()).await?,
     };
 
     let display = DisplayInfo {
@@ -557,6 +606,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         BenchKind::Postgres => "PostgreSQL wire",
         BenchKind::Mysql => "MySQL wire",
         BenchKind::Memcache => "memcached text",
+        BenchKind::S3 => "S3 / HTTPS",
     };
     let protocol = proto_observed.lock().unwrap_or(default_proto);
     let final_report =
@@ -783,6 +833,84 @@ async fn spawn_redis(
         DisplayInfo {
             kind: BenchKind::Redis,
             target: redact_url(&url),
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+        cleanup,
+    ))
+}
+
+async fn spawn_s3(
+    cli: &Cli,
+    args: S3Args,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let workload = s3_bench::S3Workload::parse(&args.workload)?;
+    let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let bucket = args
+        .bucket
+        .clone()
+        .unwrap_or_else(|| format!("databench-{run_id}"));
+
+    let cfg = s3_bench::S3Config {
+        endpoint: args.endpoint.clone(),
+        region: args.region.clone(),
+        bucket: bucket.clone(),
+        access_key: args.access_key.clone(),
+        secret_key: args.secret_key.clone(),
+        object_size: args.object_size,
+        seed_objects: args.seed_objects,
+        workload,
+        timeout: cli.timeout,
+    };
+    let client = s3_bench::build_client(&cfg).context("building S3 client")?;
+    let payload = bytes::Bytes::from(vec![0u8; args.object_size]);
+
+    let cleanup = if args.no_sandbox {
+        Cleanup::None
+    } else {
+        eprintln!(
+            "databench: creating S3 bucket `{bucket}` and seeding {} objects of {} bytes ...",
+            args.seed_objects, args.object_size
+        );
+        s3_bench::create_bucket(&client, &bucket).await?;
+        if matches!(workload, s3_bench::S3Workload::Read | s3_bench::S3Workload::Mixed | s3_bench::S3Workload::Stat) {
+            s3_bench::populate(&client, &bucket, args.seed_objects, payload.clone()).await?;
+        }
+        Cleanup::S3 {
+            client: client.clone(),
+            bucket: bucket.clone(),
+        }
+    };
+
+    let arc_cfg = Arc::new(cfg);
+    let handles =
+        s3_bench::spawn_workers(client, arc_cfg.clone(), payload, cli.connections, h);
+
+    let detail = match (args.no_sandbox, &args.bucket) {
+        (true, _) => format!(
+            "workload={}  no-sandbox  bucket={}",
+            args.workload,
+            bucket
+        ),
+        (false, _) => format!(
+            "workload={}  obj_size={}B  seed={}  bucket={}",
+            args.workload, args.object_size, args.seed_objects, bucket
+        ),
+    };
+
+    Ok((
+        BenchKind::S3,
+        DisplayInfo {
+            kind: BenchKind::S3,
+            target: args.endpoint,
             detail,
             threads: 0,
             connections: cli.connections,
@@ -1569,7 +1697,7 @@ fn draw_body(
         ],
         BenchKind::Dns => vec![phase_kv("DNS lookup    ", dns, Color::Magenta)],
         BenchKind::Ping => vec![phase_kv("Round-trip    ", ttfb, Color::Yellow)],
-        BenchKind::Redis | BenchKind::Memcache => {
+        BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => {
             vec![phase_kv("Op RTT        ", ttfb, Color::Yellow)]
         }
         BenchKind::Postgres | BenchKind::Mysql => {
@@ -1606,7 +1734,7 @@ fn draw_body(
     let title = match kind {
         BenchKind::Http => " responses ",
         BenchKind::Ping => " pings ",
-        BenchKind::Redis | BenchKind::Memcache => " ops ",
+        BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => " ops ",
         BenchKind::Postgres | BenchKind::Mysql => " txns ",
         _ => " probes ",
     };

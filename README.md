@@ -8,8 +8,8 @@ so when your numbers regress you can see *where* they regressed.
 
 ## Highlights
 
-- **Nine modes** so far: `http`, `ping`, `tcp`, `dns`, `tls`, `redis`,
-  `memcache`, `postgres`, `mysql`.
+- **Ten modes** so far: `http`, `ping`, `tcp`, `dns`, `tls`, `redis`,
+  `memcache`, `postgres`, `mysql`, `s3`.
 - **Real-world workloads** for the database modes — not toy `SELECT 1`s:
   - Redis / memcached default to `memtier_benchmark`'s 1:10 SET:GET on
     32-byte values (the canonical published "ops/sec" shape).
@@ -18,6 +18,8 @@ so when your numbers regress you can see *where* they regressed.
   - MySQL/MariaDB defaults to `sysbench`'s `oltp_read_write`
     (10 point selects + 4 range queries + 2 updates + 1 delete + 1 insert
     per transaction).
+  - S3 / MinIO defaults to `warp`'s mixed mix (45% GET, 30% STAT,
+    15% PUT, 10% DELETE).
 - **Sandbox by default** — every database mode creates a unique
   `databench_<runid>` namespace, populates it, runs the workload there,
   and cleans up at the end. `Ctrl-C` is honoured. Cleanup refuses to
@@ -187,6 +189,36 @@ statement set are the canonical sysbench `sbtest1`.
 `caching_sha2_password` which the underlying driver doesn't speak
 without TLS — start the server with `mysql_native_password` if you hit
 auth-hangs.
+
+### s3
+
+Object-store benchmark, modelled on MinIO's `warp`. Sandboxed in a
+fresh `databench-<runid>` bucket; pre-seeds N objects, runs the
+workload, then deletes every object and the bucket on exit. Cleanup
+refuses to touch any bucket whose name doesn't start with `databench-`.
+
+    # MinIO local — uses minioadmin/minioadmin defaults
+    docker run -d --rm --name minio -p 9000:9000 -p 9001:9001 \
+        -e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+        minio/minio server /data --console-address ":9001"
+
+    databench -c 32 -z 30s --warmup 5s s3 http://127.0.0.1:9000
+
+    # warp-shaped large-object run
+    databench -c 16 -z 30s s3 http://127.0.0.1:9000 \
+        --object-size 10485760 --seed-objects 100
+
+    # AWS S3
+    DATABENCH_S3_ACCESS_KEY=... DATABENCH_S3_SECRET_KEY=... \
+        databench -c 32 -z 60s s3 https://s3.us-east-1.amazonaws.com \
+        --region us-east-1
+
+`s3` flags: `--access-key`, `--secret-key` (or `DATABENCH_S3_*` env),
+`--region`, `--workload {read|mixed|write|stat}`, `--object-size`,
+`--seed-objects`, `--bucket`, `--no-sandbox`. Mixed mode shows
+`GET_404` / `STAT_404` in the per-op table separately from real
+hits — those are objects the workload's own DELETEs removed earlier
+in the run, not server errors.
 
 ## What you get back
 

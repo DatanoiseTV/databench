@@ -15,6 +15,7 @@ pub enum BenchKind {
     Postgres,
     Mysql,
     Memcache,
+    S3,
 }
 
 impl BenchKind {
@@ -29,6 +30,7 @@ impl BenchKind {
             BenchKind::Postgres => "PostgreSQL",
             BenchKind::Mysql => "MySQL",
             BenchKind::Memcache => "memcached",
+            BenchKind::S3 => "S3",
         }
     }
 
@@ -38,7 +40,7 @@ impl BenchKind {
             BenchKind::Ping => "ping",
             BenchKind::Tcp | BenchKind::Tls => "conn",
             BenchKind::Dns => "lookup",
-            BenchKind::Redis | BenchKind::Memcache => "op",
+            BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => "op",
             BenchKind::Postgres | BenchKind::Mysql => "txn",
         }
     }
@@ -50,7 +52,7 @@ impl BenchKind {
             BenchKind::Tcp => "conns",
             BenchKind::Dns => "lookups",
             BenchKind::Tls => "handshakes",
-            BenchKind::Redis | BenchKind::Memcache => "ops",
+            BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => "ops",
             BenchKind::Postgres | BenchKind::Mysql => "txns",
         }
     }
@@ -616,7 +618,7 @@ pub fn render_final(r: &FinalReport) -> String {
         BenchKind::Ping => {
             req_rows.push(("Round-trip time   ", &r.total));
         }
-        BenchKind::Redis | BenchKind::Memcache => {
+        BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => {
             req_rows.push(("Op latency        ", &r.total));
         }
         BenchKind::Postgres | BenchKind::Mysql => {
