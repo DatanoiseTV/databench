@@ -28,7 +28,11 @@ use crate::worker::{try_reserve_budget, WorkerHandles};
 pub enum RedisWorkload {
     /// 100% GET.
     Read,
-    /// 80% GET, 15% SET, 5% INCR — typical cache pattern.
+    /// 90% GET / 10% SET, 32-byte values — what `memtier_benchmark` runs
+    /// by default and what published "Redis ops/sec" numbers refer to.
+    Memtier,
+    /// 50% GET / 50% SET — balanced view of the cache under sustained
+    /// write pressure.
     Mixed,
     /// 100% SET.
     Write,
@@ -38,10 +42,11 @@ impl RedisWorkload {
     pub fn parse(s: &str) -> Result<Self> {
         match s.to_ascii_lowercase().as_str() {
             "read" | "get" | "get-only" => Ok(Self::Read),
+            "memtier" => Ok(Self::Memtier),
             "mixed" | "mix" => Ok(Self::Mixed),
             "write" | "set" | "set-only" => Ok(Self::Write),
             other => Err(anyhow!(
-                "unknown workload '{other}'; expected read, mixed, or write"
+                "unknown workload '{other}'; expected read | memtier | mixed | write"
             )),
         }
     }
@@ -218,7 +223,8 @@ async fn run_worker(cfg: Arc<RedisConfig>, h: WorkerHandles, worker_idx: u64) ->
     });
 
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
@@ -230,6 +236,16 @@ async fn run_worker(cfg: Arc<RedisConfig>, h: WorkerHandles, worker_idx: u64) ->
                 .await
         };
 
+        if !measuring {
+            // Reconnect on error during warmup but otherwise discard.
+            if outcome.is_err() {
+                if let Ok((_, c)) = connect(&cfg.url).await {
+                    conn = c;
+                }
+            }
+            continue;
+        }
+
         match outcome {
             Ok(OpResult { op, latency_us, bytes }) => {
                 report.record_op(&op, latency_us);
@@ -239,7 +255,6 @@ async fn run_worker(cfg: Arc<RedisConfig>, h: WorkerHandles, worker_idx: u64) ->
             }
             Err(e) => {
                 report.record_error(&h.live, &format!("redis: {}", e));
-                // try to reconnect
                 if let Ok((_, c)) = connect(&cfg.url).await {
                     conn = c;
                 }
@@ -266,14 +281,21 @@ async fn run_workload(
     let pick = match workload {
         RedisWorkload::Read => Op::Get,
         RedisWorkload::Write => Op::Set,
-        RedisWorkload::Mixed => {
-            let r: u32 = rng.gen_range(0..100);
-            if r < 80 {
-                Op::Get
-            } else if r < 95 {
+        RedisWorkload::Memtier => {
+            // memtier_benchmark default: SET:GET = 1:10 → ~9.1% SET / 90.9% GET.
+            let r: u32 = rng.gen_range(0..11);
+            if r == 0 {
                 Op::Set
             } else {
-                Op::Incr
+                Op::Get
+            }
+        }
+        RedisWorkload::Mixed => {
+            let r: u32 = rng.gen_range(0..2);
+            if r == 0 {
+                Op::Get
+            } else {
+                Op::Set
             }
         }
     };
@@ -287,17 +309,12 @@ async fn run_workload(
             v.map(|x| x.len()).unwrap_or(0) as u64
         }
         Op::Set => {
-            // 64-byte fixed payload — small enough not to dominate, big
-            // enough to exercise serialization.
-            let mut value = [0u8; 64];
+            // 32-byte fixed payload matches memtier_benchmark's default
+            // value size — what published Redis numbers measure against.
+            let mut value = [0u8; 32];
             rng.fill(&mut value[..]);
             let _: () = run_with_timeout(conn.set::<_, _, ()>(&key, &value[..]), timeout).await?;
             value.len() as u64
-        }
-        Op::Incr => {
-            let counter = format!("{prefix}counter:{}", key_idx % 16);
-            let _: i64 = run_with_timeout(conn.incr::<_, _, i64>(&counter, 1i64), timeout).await?;
-            0
         }
     };
     let latency_us = start.elapsed().as_micros() as u64;
@@ -344,7 +361,6 @@ where
 enum Op {
     Get,
     Set,
-    Incr,
 }
 
 impl Op {
@@ -352,7 +368,6 @@ impl Op {
         match self {
             Op::Get => "GET",
             Op::Set => "SET",
-            Op::Incr => "INCR",
         }
     }
 }

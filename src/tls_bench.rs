@@ -55,12 +55,13 @@ async fn run_worker(
         }
     };
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
         match probe(&cfg, &connector).await {
-            Ok((dns_us, tcp_us, tls_us, proto)) => {
+            Ok((dns_us, tcp_us, tls_us, proto)) if measuring => {
                 let total = dns_us + tcp_us + tls_us;
                 report.record_phase(PhaseKind::Dns, dns_us);
                 report.record_phase(PhaseKind::Tcp, tcp_us);
@@ -75,9 +76,10 @@ async fn run_worker(
                     *g = Some(proto);
                 }
             }
-            Err(e) => {
+            Err(e) if measuring => {
                 report.record_error(&h.live, &format!("tls: {}", e));
             }
+            _ => {}
         }
     }
     report

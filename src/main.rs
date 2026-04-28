@@ -74,6 +74,13 @@ struct Cli {
     /// Applies across all workers. Useful for gentle production probing.
     #[arg(long = "qps", global = true)]
     qps: Option<f64>,
+
+    /// Warmup duration. Probes during warmup hit the server but their
+    /// latencies are discarded and they don't consume `--requests`. Use
+    /// to skip cold-cache / JIT / prepared-statement-priming artifacts.
+    /// Recommended: 10s for KV stores, 30s for SQL.
+    #[arg(long = "warmup", value_parser = humantime::parse_duration, global = true)]
+    warmup: Option<Duration>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -161,14 +168,17 @@ struct RedisArgs {
     /// Force TLS even if the URL doesn't say rediss://.
     #[arg(long = "tls")]
     tls: bool,
-    /// Workload preset: read | mixed | write. Default `mixed`.
-    #[arg(long = "workload", default_value = "mixed")]
+    /// Workload preset: read | memtier (default) | mixed | write.
+    /// `memtier` matches memtier_benchmark's canonical 1:10 SET:GET mix.
+    #[arg(long = "workload", default_value = "memtier")]
     workload: String,
-    /// Number of keys to seed in the sandbox.
-    #[arg(long = "seed-keys", default_value_t = 10_000)]
+    /// Number of keys to seed in the sandbox. memtier_benchmark canon
+    /// is ~1M; default 100k seeds in a few seconds and is enough to
+    /// avoid single-cache-line artifacts.
+    #[arg(long = "seed-keys", default_value_t = 100_000)]
     seed_keys: usize,
-    /// Value size (bytes) for seeded keys.
-    #[arg(long = "seed-value-size", default_value_t = 256)]
+    /// Value size (bytes) for seeded keys. 32 = memtier_benchmark default.
+    #[arg(long = "seed-value-size", default_value_t = 32)]
     seed_value_size: usize,
     /// TTL on every seeded key, in seconds. Belt-and-suspenders cleanup.
     #[arg(long = "seed-ttl", default_value_t = 3600)]
@@ -317,22 +327,41 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         });
     }
 
-    // Duration deadline.
+    let warmup = cli.warmup.unwrap_or(Duration::ZERO);
+
+    // Duration deadline. With --warmup, we sleep warmup+duration so the
+    // measurement window is exactly `duration` long.
     if let Some(dur) = duration {
         let stop = stop.clone();
+        let total = warmup + dur;
         tokio::spawn(async move {
-            tokio::time::sleep(dur).await;
+            tokio::time::sleep(total).await;
             stop.store(true, Ordering::Relaxed);
         });
     }
 
     let qps = cli.qps.and_then(ratelimit::RateLimiter::from_qps);
+    // Recording starts immediately if no warmup was requested.
+    let recording = Arc::new(AtomicBool::new(warmup.is_zero()));
     let h = WorkerHandles {
         stop: stop.clone(),
         remaining: remaining.clone(),
         live: live.clone(),
         qps,
+        recording: recording.clone(),
     };
+
+    // After the warmup window, zero the live counters and flip
+    // `recording` so workers start counting probes against the budget.
+    if !warmup.is_zero() {
+        let live = live.clone();
+        let recording = recording.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(warmup).await;
+            live.reset();
+            recording.store(true, Ordering::Relaxed);
+        });
+    }
 
     let started_at = Instant::now();
 
@@ -410,7 +439,8 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         eprintln!("databench: cleanup failed: {e}");
     }
 
-    let total_duration = started_at.elapsed();
+    // Subtract the warmup window so RPS / total reflect measured time only.
+    let total_duration = started_at.elapsed().saturating_sub(warmup);
     let default_proto: &'static str = match kind {
         BenchKind::Http => "HTTP/1.1",
         BenchKind::Ping => "ICMP",

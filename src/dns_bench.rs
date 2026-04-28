@@ -35,20 +35,22 @@ pub fn spawn_workers(
 async fn run_worker(cfg: Arc<DnsConfig>, h: WorkerHandles) -> WorkerReport {
     let mut report = WorkerReport::new();
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
         match probe(&cfg).await {
-            Ok(dns_us) => {
+            Ok(dns_us) if measuring => {
                 report.record_phase(PhaseKind::Dns, dns_us);
                 report.record_probe(dns_us);
                 h.live.requests.fetch_add(1, Ordering::Relaxed);
                 h.live.record_phase_live(PhaseKind::Dns, dns_us);
             }
-            Err(e) => {
+            Err(e) if measuring => {
                 report.record_error(&h.live, &format!("dns: {}", e));
             }
+            _ => {}
         }
     }
     report

@@ -36,12 +36,13 @@ pub fn spawn_workers(
 async fn run_worker(cfg: Arc<TcpConfig>, h: WorkerHandles) -> WorkerReport {
     let mut report = WorkerReport::new();
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
         match probe(&cfg).await {
-            Ok((dns_us, tcp_us)) => {
+            Ok((dns_us, tcp_us)) if measuring => {
                 let total = dns_us + tcp_us;
                 report.record_phase(PhaseKind::Dns, dns_us);
                 report.record_phase(PhaseKind::Tcp, tcp_us);
@@ -50,9 +51,10 @@ async fn run_worker(cfg: Arc<TcpConfig>, h: WorkerHandles) -> WorkerReport {
                 h.live.record_phase_live(PhaseKind::Dns, dns_us);
                 h.live.record_phase_live(PhaseKind::Tcp, tcp_us);
             }
-            Err(e) => {
+            Err(e) if measuring => {
                 report.record_error(&h.live, &format!("tcp: {}", e));
             }
+            _ => {}
         }
     }
     report

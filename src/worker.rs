@@ -51,6 +51,10 @@ pub struct WorkerHandles {
     pub live: Arc<LiveStats>,
     /// Optional shared QPS gate. `None` = unthrottled.
     pub qps: Option<Arc<RateLimiter>>,
+    /// True once the warmup period has ended (or immediately, if no
+    /// warmup was configured). Workers run probes either way, but they
+    /// neither consume budget nor record stats while this is false.
+    pub recording: Arc<AtomicBool>,
 }
 
 impl WorkerHandles {
@@ -59,6 +63,15 @@ impl WorkerHandles {
         if let Some(rl) = &self.qps {
             rl.acquire().await;
         }
+    }
+
+    /// Whether workers should currently record stats / consume budget.
+    /// During warmup this is false — probes still hit the server, but
+    /// their latencies are discarded so the warm-cache distribution
+    /// dominates the published numbers.
+    #[inline]
+    pub fn measuring(&self) -> bool {
+        self.recording.load(Ordering::Relaxed)
     }
 }
 
@@ -137,20 +150,27 @@ pub async fn run_worker(
         }
 
         let connect_fut = connect(&cfg, tls_conn.as_ref());
+        let conn_measuring = h.measuring();
         let (sender_built, phases) = match tokio::time::timeout(cfg.timeout, connect_fut).await {
             Ok(Ok(c)) => c,
             Ok(Err(e)) => {
-                report.record_error(&h.live, &format!("connect: {}", classify(&e)));
+                if conn_measuring {
+                    report.record_error(&h.live, &format!("connect: {}", classify(&e)));
+                }
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             }
             Err(_) => {
-                report.record_error(&h.live, "connect: timeout");
+                if conn_measuring {
+                    report.record_error(&h.live, "connect: timeout");
+                }
                 continue;
             }
         };
-        report.record_connection(&phases);
-        h.live.record_connection_phases(&phases);
+        if conn_measuring {
+            report.record_connection(&phases);
+            h.live.record_connection_phases(&phases);
+        }
 
         {
             let mut g = proto_observed.lock();
@@ -174,25 +194,28 @@ pub async fn run_worker(
             // an error if we never successfully exchanged a request on this
             // connection (truly broken peer).
             if let Err(e) = sender.ready().await {
-                if requests_on_conn == 0 {
+                if requests_on_conn == 0 && h.measuring() {
                     report.record_error(&h.live, &format!("send-ready: {}", chain_msg(&e)));
                 }
                 continue 'outer;
             }
 
-            // Reserve a request slot only once we know the conn is writable.
-            // AtomicI64 < 0 means unbounded.
-            let prev = h.remaining.load(Ordering::Relaxed);
-            if prev >= 0 {
-                if prev == 0 {
-                    break 'outer;
-                }
-                if h
-                    .remaining
-                    .compare_exchange(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_err()
-                {
-                    continue;
+            let measuring = h.measuring();
+            // Reserve a request slot only once we know the conn is writable
+            // *and* we're past warmup. AtomicI64 < 0 means unbounded.
+            if measuring {
+                let prev = h.remaining.load(Ordering::Relaxed);
+                if prev >= 0 {
+                    if prev == 0 {
+                        break 'outer;
+                    }
+                    if h
+                        .remaining
+                        .compare_exchange(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
+                        .is_err()
+                    {
+                        continue;
+                    }
                 }
             }
 
@@ -202,11 +225,15 @@ pub async fn run_worker(
             let resp = match tokio::time::timeout(cfg.timeout, sender.send(req)).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    report.record_error(&h.live, &format!("send: {}", chain_msg(&e)));
+                    if measuring {
+                        report.record_error(&h.live, &format!("send: {}", chain_msg(&e)));
+                    }
                     continue 'outer;
                 }
                 Err(_) => {
-                    report.record_error(&h.live, "send: timeout");
+                    if measuring {
+                        report.record_error(&h.live, "send: timeout");
+                    }
                     continue 'outer;
                 }
             };
@@ -219,18 +246,22 @@ pub async fn run_worker(
             let body_bytes = match drain_body_with_timeout(resp.into_body(), cfg.timeout).await {
                 Ok(b) => b,
                 Err(e) => {
-                    report.record_error(&h.live, &format!("body: {}", e));
+                    if measuring {
+                        report.record_error(&h.live, &format!("body: {}", e));
+                    }
                     continue 'outer;
                 }
             };
             let body_us = body_start.elapsed().as_micros() as u64;
             let total_us = send_start.elapsed().as_micros() as u64;
 
-            report.record_request(ttfb_us, body_us, total_us, status, body_bytes);
-            h.live.requests.fetch_add(1, Ordering::Relaxed);
-            h.live.bytes.fetch_add(body_bytes, Ordering::Relaxed);
-            h.live.record_status(status);
-            h.live.record_request_phases(ttfb_us, body_us);
+            if measuring {
+                report.record_request(ttfb_us, body_us, total_us, status, body_bytes);
+                h.live.requests.fetch_add(1, Ordering::Relaxed);
+                h.live.bytes.fetch_add(body_bytes, Ordering::Relaxed);
+                h.live.record_status(status);
+                h.live.record_request_phases(ttfb_us, body_us);
+            }
             requests_on_conn += 1;
 
             if !cfg.keepalive {

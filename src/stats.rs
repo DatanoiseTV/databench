@@ -134,6 +134,36 @@ impl LiveStats {
         self.body_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Zero every live counter. Called at the end of the warmup phase
+    /// so the dashboard and live snapshot reflect only post-warmup work.
+    pub fn reset(&self) {
+        for a in [
+            &self.requests,
+            &self.errors,
+            &self.bytes,
+            &self.status_1xx,
+            &self.status_2xx,
+            &self.status_3xx,
+            &self.status_4xx,
+            &self.status_5xx,
+            &self.dns_us_sum,
+            &self.dns_count,
+            &self.tcp_us_sum,
+            &self.tcp_count,
+            &self.tls_us_sum,
+            &self.tls_count,
+            &self.hs_us_sum,
+            &self.hs_count,
+            &self.ttfb_us_sum,
+            &self.ttfb_count,
+            &self.body_us_sum,
+            &self.body_count,
+            &self.connections,
+        ] {
+            a.store(0, Ordering::Relaxed);
+        }
+    }
+
     pub fn record_phase_live(&self, phase: PhaseKind, us: u64) {
         let (sum, count) = match phase {
             PhaseKind::Dns => (&self.dns_us_sum, &self.dns_count),
@@ -225,8 +255,57 @@ pub struct WorkerReport {
     /// Per-operation latency histograms keyed by op name (e.g. "GET",
     /// "SET", "tpcb-update"). Used by backends with multiple op types.
     pub per_op: HashMap<String, Histogram<u64>>,
+    /// Top-N individual slowest probes seen by this worker. Sorted
+    /// descending by latency. Merged across workers in the final report
+    /// so one outlier in any worker still surfaces.
+    pub slowest: SlowQueries,
     pub bytes: u64,
     pub requests: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlowQuery {
+    pub op: String,
+    pub latency_us: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SlowQueries {
+    pub n: usize,
+    pub items: Vec<SlowQuery>, // sorted desc by latency_us
+}
+
+impl SlowQueries {
+    pub fn new(n: usize) -> Self {
+        Self {
+            n,
+            items: Vec::with_capacity(n),
+        }
+    }
+
+    pub fn record(&mut self, op: &str, latency_us: u64) {
+        if self.items.len() < self.n {
+            self.items.push(SlowQuery {
+                op: op.to_string(),
+                latency_us,
+            });
+            self.items
+                .sort_unstable_by(|a, b| b.latency_us.cmp(&a.latency_us));
+        } else if let Some(tail) = self.items.last_mut() {
+            if latency_us > tail.latency_us {
+                tail.op = op.to_string();
+                tail.latency_us = latency_us;
+                self.items
+                    .sort_unstable_by(|a, b| b.latency_us.cmp(&a.latency_us));
+            }
+        }
+    }
+
+    pub fn merge(&mut self, other: &SlowQueries) {
+        for q in &other.items {
+            self.record(&q.op, q.latency_us);
+        }
+    }
 }
 
 fn new_hist() -> Histogram<u64> {
@@ -252,6 +331,7 @@ impl WorkerReport {
             status_codes: HashMap::new(),
             errors: HashMap::new(),
             per_op: HashMap::new(),
+            slowest: SlowQueries::new(20),
             bytes: 0,
             requests: 0,
         }
@@ -260,6 +340,8 @@ impl WorkerReport {
     /// Record a successful op with its label, e.g. "GET" or "tpcb-update".
     /// Bumps both the per-op histogram and the global `total` histogram so
     /// the dashboard's primary latency line still aggregates everything.
+    /// Also feeds the slow-queries top-N so outliers surface in the final
+    /// report.
     pub fn record_op(&mut self, op: &str, total_us: u64) {
         record_us(&mut self.total, total_us);
         let h = self
@@ -267,6 +349,7 @@ impl WorkerReport {
             .entry(op.to_string())
             .or_insert_with(new_hist);
         record_us(h, total_us);
+        self.slowest.record(op, total_us);
         self.requests += 1;
     }
 
@@ -334,6 +417,7 @@ pub struct FinalReport {
     pub status_codes: HashMap<u16, u64>,
     pub errors: HashMap<String, u64>,
     pub per_op: HashMap<String, Histogram<u64>>,
+    pub slowest: SlowQueries,
     pub bytes: u64,
     pub requests: u64,
     pub success: u64,
@@ -359,6 +443,7 @@ impl FinalReport {
         let mut status_codes: HashMap<u16, u64> = HashMap::new();
         let mut errors: HashMap<String, u64> = HashMap::new();
         let mut per_op: HashMap<String, Histogram<u64>> = HashMap::new();
+        let mut slowest = SlowQueries::new(20);
         let mut bytes = 0u64;
         let mut requests = 0u64;
         let mut success = 0u64;
@@ -382,6 +467,7 @@ impl FinalReport {
                 let dst = per_op.entry(op).or_insert_with(new_hist);
                 dst.add(&hist).ok();
             }
+            slowest.merge(&r.slowest);
             bytes += r.bytes;
             requests += r.requests;
         }
@@ -408,6 +494,7 @@ impl FinalReport {
             status_codes,
             errors,
             per_op,
+            slowest,
             bytes,
             requests,
             success,
@@ -554,6 +641,19 @@ pub fn render_final(r: &FinalReport) -> String {
                 short_dur(h.value_at_quantile(0.95)),
                 short_dur(h.value_at_quantile(0.99)),
                 short_dur(h.max()),
+            ));
+        }
+    }
+
+    if !r.slowest.items.is_empty() {
+        out.push_str("\nSlowest probes:\n");
+        out.push_str(&format!("  {:<3}  {:<22} {:>12}\n", "#", "op", "latency"));
+        for (i, q) in r.slowest.items.iter().enumerate() {
+            out.push_str(&format!(
+                "  {:<3}  {:<22} {:>12}\n",
+                i + 1,
+                q.op,
+                short_dur(q.latency_us)
             ));
         }
     }

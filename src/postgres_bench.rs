@@ -442,7 +442,8 @@ async fn run_worker(cfg: Arc<PgConfig>, h: WorkerHandles, worker_idx: u64) -> Wo
     let n_branches: i32 = scale;
 
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
@@ -481,6 +482,18 @@ async fn run_worker(cfg: Arc<PgConfig>, h: WorkerHandles, worker_idx: u64) -> Wo
             }
         };
 
+        if !measuring {
+            // Discard outcome during warmup; reconnect on transient error.
+            if result.is_err() {
+                if let Ok(c) = connect(&cfg.server_url).await {
+                    if let Ok(p) = prepare(&c, cfg.workload, cfg.custom_query.as_deref()).await {
+                        client = c;
+                        prep = p;
+                    }
+                }
+            }
+            continue;
+        }
         match result {
             Ok(ops) => {
                 for (op, us) in &ops {

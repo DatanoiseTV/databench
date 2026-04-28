@@ -84,23 +84,26 @@ async fn run_worker(
 
     let mut seq: u16 = 0;
     while !h.stop.load(Ordering::Relaxed) {
-        if try_reserve_budget(&h.remaining).is_none() {
+        let measuring = h.measuring();
+        if measuring && try_reserve_budget(&h.remaining).is_none() {
             break;
         }
         h.rate_gate().await;
         let start = Instant::now();
-        match pinger.ping(PingSequence(seq), &payload).await {
-            Ok((_packet, rtt)) => {
-                let rtt_us = rtt.as_micros() as u64;
-                report.record_probe(rtt_us);
-                h.live.requests.fetch_add(1, Ordering::Relaxed);
-                h.live.bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                // Record RTT under TTFB so the live phase panel has data.
-                h.live.record_request_phases(rtt_us, 0);
-            }
-            Err(e) => {
-                let _ = start;
-                report.record_error(&h.live, &format!("ping: {}", e));
+        let res = pinger.ping(PingSequence(seq), &payload).await;
+        if measuring {
+            match res {
+                Ok((_packet, rtt)) => {
+                    let rtt_us = rtt.as_micros() as u64;
+                    report.record_probe(rtt_us);
+                    h.live.requests.fetch_add(1, Ordering::Relaxed);
+                    h.live.bytes.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                    h.live.record_request_phases(rtt_us, 0);
+                }
+                Err(e) => {
+                    let _ = start;
+                    report.record_error(&h.live, &format!("ping: {}", e));
+                }
             }
         }
         seq = seq.wrapping_add(1);
