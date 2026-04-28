@@ -390,15 +390,25 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
 
     let live = Arc::new(LiveStats::default());
     let stop = Arc::new(AtomicBool::new(false));
+    let stop_notify = Arc::new(tokio::sync::Notify::new());
     let remaining = Arc::new(AtomicI64::new(request_budget));
     let proto_observed = Arc::new(Mutex::new(None::<&'static str>));
 
+    let signal_stop = {
+        let stop = stop.clone();
+        let notify = stop_notify.clone();
+        move || {
+            stop.store(true, Ordering::Relaxed);
+            notify.notify_waiters();
+        }
+    };
+
     // Ctrl+C handler.
     {
-        let stop = stop.clone();
+        let signal = signal_stop.clone();
         tokio::spawn(async move {
             let _ = tokio::signal::ctrl_c().await;
-            stop.store(true, Ordering::Relaxed);
+            signal();
         });
     }
 
@@ -407,11 +417,11 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
     // Duration deadline. With --warmup, we sleep warmup+duration so the
     // measurement window is exactly `duration` long.
     if let Some(dur) = duration {
-        let stop = stop.clone();
+        let signal = signal_stop.clone();
         let total = warmup + dur;
         tokio::spawn(async move {
             tokio::time::sleep(total).await;
-            stop.store(true, Ordering::Relaxed);
+            signal();
         });
     }
 
@@ -420,6 +430,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
     let recording = Arc::new(AtomicBool::new(warmup.is_zero()));
     let h = WorkerHandles {
         stop: stop.clone(),
+        stop_notify: stop_notify.clone(),
         remaining: remaining.clone(),
         live: live.clone(),
         qps,
@@ -477,6 +488,23 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         ..display
     };
 
+    // Backstop: if stop has fired and one second of grace passes,
+    // hard-abort any worker still running so a hung probe can't drag
+    // the run on indefinitely. Workers that exit cleanly within the
+    // grace period contribute their full reports; aborted ones return
+    // JoinError and are silently dropped.
+    {
+        let stop_notify = stop_notify.clone();
+        let abort_handles: Vec<_> = handles.iter().map(|h| h.abort_handle()).collect();
+        tokio::spawn(async move {
+            stop_notify.notified().await;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            for h in abort_handles {
+                h.abort();
+            }
+        });
+    }
+
     // Live UI.
     let use_tui = !cli.no_tui && stdout().is_terminal();
     if use_tui {
@@ -487,6 +515,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
             cli.requests,
             live.clone(),
             stop.clone(),
+            stop_notify.clone(),
             proto_observed.clone(),
             &handles,
         )
@@ -504,7 +533,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         .await;
     }
 
-    stop.store(true, Ordering::Relaxed);
+    signal_stop();
     let mut reports = Vec::with_capacity(handles.len());
     for h in handles {
         if let Ok(r) = h.await {
@@ -1199,6 +1228,7 @@ async fn run_tui(
     request_target: Option<u64>,
     live: Arc<LiveStats>,
     stop: Arc<AtomicBool>,
+    stop_notify: Arc<tokio::sync::Notify>,
     proto: Arc<Mutex<Option<&'static str>>>,
     handles: &[JoinHandle<WorkerReport>],
 ) -> Result<()> {
@@ -1223,6 +1253,7 @@ async fn run_tui(
         request_target,
         &live,
         &stop,
+        &stop_notify,
         &proto,
         handles,
         &mut last_snapshot,
@@ -1247,6 +1278,7 @@ async fn tui_loop(
     request_target: Option<u64>,
     live: &Arc<LiveStats>,
     stop: &Arc<AtomicBool>,
+    stop_notify: &Arc<tokio::sync::Notify>,
     proto: &Arc<Mutex<Option<&'static str>>>,
     handles: &[JoinHandle<WorkerReport>],
     last_snapshot: &mut LiveSnapshot,
@@ -1307,6 +1339,7 @@ async fn tui_loop(
                         || matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc)
                     {
                         stop.store(true, Ordering::Relaxed);
+                        stop_notify.notify_waiters();
                     }
                 }
             }

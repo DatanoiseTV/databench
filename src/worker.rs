@@ -46,6 +46,10 @@ pub struct WorkerConfig {
 #[derive(Clone)]
 pub struct WorkerHandles {
     pub stop: Arc<AtomicBool>,
+    /// Notify all waiters as soon as `stop` is set so workers stuck
+    /// inside a slow probe await wake immediately instead of
+    /// discovering `stop = true` only at the top of their loop.
+    pub stop_notify: Arc<tokio::sync::Notify>,
     /// Remaining request budget. Negative = unbounded (duration mode).
     pub remaining: Arc<AtomicI64>,
     pub live: Arc<LiveStats>,
@@ -55,6 +59,16 @@ pub struct WorkerHandles {
     /// warmup was configured). Workers run probes either way, but they
     /// neither consume budget nor record stats while this is false.
     pub recording: Arc<AtomicBool>,
+}
+
+/// Outcome of awaiting a probe alongside the global stop signal.
+pub enum RaceResult<T> {
+    /// Probe completed.
+    Ok(T),
+    /// Per-probe timeout expired.
+    Timeout,
+    /// `stop` was signalled — caller should exit the worker loop.
+    Stopped,
 }
 
 impl WorkerHandles {
@@ -72,6 +86,34 @@ impl WorkerHandles {
     #[inline]
     pub fn measuring(&self) -> bool {
         self.recording.load(Ordering::Relaxed)
+    }
+
+    /// Race `fut` against the stop signal and a per-probe timeout.
+    /// `biased` ensures stop wins when both are ready (the user pressed
+    /// Esc; we want out *now*, not after one more probe).
+    pub async fn race<F, T>(&self, timeout: Duration, fut: F) -> RaceResult<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::select! {
+            biased;
+            _ = self.stop_notify.notified() => RaceResult::Stopped,
+            _ = tokio::time::sleep(timeout) => RaceResult::Timeout,
+            v = fut => RaceResult::Ok(v),
+        }
+    }
+
+    /// Race a future against just the stop signal — for awaits where
+    /// the existing code already wraps in its own timeout.
+    pub async fn race_stop<F, T>(&self, fut: F) -> Option<T>
+    where
+        F: std::future::Future<Output = T>,
+    {
+        tokio::select! {
+            biased;
+            _ = self.stop_notify.notified() => None,
+            v = fut => Some(v),
+        }
     }
 }
 
@@ -151,21 +193,22 @@ pub async fn run_worker(
 
         let connect_fut = connect(&cfg, tls_conn.as_ref());
         let conn_measuring = h.measuring();
-        let (sender_built, phases) = match tokio::time::timeout(cfg.timeout, connect_fut).await {
-            Ok(Ok(c)) => c,
-            Ok(Err(e)) => {
+        let (sender_built, phases) = match h.race(cfg.timeout, connect_fut).await {
+            RaceResult::Ok(Ok(c)) => c,
+            RaceResult::Ok(Err(e)) => {
                 if conn_measuring {
                     report.record_error(&h.live, &format!("connect: {}", classify(&e)));
                 }
                 tokio::time::sleep(Duration::from_millis(5)).await;
                 continue;
             }
-            Err(_) => {
+            RaceResult::Timeout => {
                 if conn_measuring {
                     report.record_error(&h.live, "connect: timeout");
                 }
                 continue;
             }
+            RaceResult::Stopped => break 'outer,
         };
         if conn_measuring {
             report.record_connection(&phases);
@@ -222,20 +265,21 @@ pub async fn run_worker(
             h.rate_gate().await;
             let req = build_request(&cfg, use_full_uri);
             let send_start = Instant::now();
-            let resp = match tokio::time::timeout(cfg.timeout, sender.send(req)).await {
-                Ok(Ok(r)) => r,
-                Ok(Err(e)) => {
+            let resp = match h.race(cfg.timeout, sender.send(req)).await {
+                RaceResult::Ok(Ok(r)) => r,
+                RaceResult::Ok(Err(e)) => {
                     if measuring {
                         report.record_error(&h.live, &format!("send: {}", chain_msg(&e)));
                     }
                     continue 'outer;
                 }
-                Err(_) => {
+                RaceResult::Timeout => {
                     if measuring {
                         report.record_error(&h.live, "send: timeout");
                     }
                     continue 'outer;
                 }
+                RaceResult::Stopped => break 'outer,
             };
             // Response future resolves once response headers are received,
             // so this is the time to first byte.
