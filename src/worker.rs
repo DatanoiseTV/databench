@@ -13,6 +13,7 @@ use parking_lot::Mutex;
 use tokio::net::{lookup_host, TcpStream};
 use tokio_rustls::TlsConnector;
 
+use crate::ratelimit::RateLimiter;
 use crate::stats::{LiveStats, PhaseConnect, WorkerReport};
 use crate::tls;
 
@@ -48,6 +49,17 @@ pub struct WorkerHandles {
     /// Remaining request budget. Negative = unbounded (duration mode).
     pub remaining: Arc<AtomicI64>,
     pub live: Arc<LiveStats>,
+    /// Optional shared QPS gate. `None` = unthrottled.
+    pub qps: Option<Arc<RateLimiter>>,
+}
+
+impl WorkerHandles {
+    /// Block until the rate limiter (if any) lets us through.
+    pub async fn rate_gate(&self) {
+        if let Some(rl) = &self.qps {
+            rl.acquire().await;
+        }
+    }
 }
 
 /// Try to reserve one unit from the shared request budget. Returns
@@ -184,6 +196,7 @@ pub async fn run_worker(
                 }
             }
 
+            h.rate_gate().await;
             let req = build_request(&cfg, use_full_uri);
             let send_start = Instant::now();
             let resp = match tokio::time::timeout(cfg.timeout, sender.send(req)).await {

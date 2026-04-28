@@ -11,6 +11,10 @@ pub enum BenchKind {
     Tcp,
     Dns,
     Tls,
+    Redis,
+    Postgres,
+    Mysql,
+    Memcache,
 }
 
 impl BenchKind {
@@ -21,6 +25,10 @@ impl BenchKind {
             BenchKind::Tcp => "TCP connect",
             BenchKind::Dns => "DNS lookup",
             BenchKind::Tls => "TLS handshake",
+            BenchKind::Redis => "Redis",
+            BenchKind::Postgres => "PostgreSQL",
+            BenchKind::Mysql => "MySQL",
+            BenchKind::Memcache => "memcached",
         }
     }
 
@@ -28,9 +36,10 @@ impl BenchKind {
         match self {
             BenchKind::Http => "req",
             BenchKind::Ping => "ping",
-            BenchKind::Tcp => "conn",
+            BenchKind::Tcp | BenchKind::Tls => "conn",
             BenchKind::Dns => "lookup",
-            BenchKind::Tls => "handshake",
+            BenchKind::Redis | BenchKind::Memcache => "op",
+            BenchKind::Postgres | BenchKind::Mysql => "txn",
         }
     }
 
@@ -41,6 +50,8 @@ impl BenchKind {
             BenchKind::Tcp => "conns",
             BenchKind::Dns => "lookups",
             BenchKind::Tls => "handshakes",
+            BenchKind::Redis | BenchKind::Memcache => "ops",
+            BenchKind::Postgres | BenchKind::Mysql => "txns",
         }
     }
 }
@@ -211,6 +222,9 @@ pub struct WorkerReport {
     pub http_handshake: Histogram<u64>,
     pub status_codes: HashMap<u16, u64>,
     pub errors: HashMap<String, u64>,
+    /// Per-operation latency histograms keyed by op name (e.g. "GET",
+    /// "SET", "tpcb-update"). Used by backends with multiple op types.
+    pub per_op: HashMap<String, Histogram<u64>>,
     pub bytes: u64,
     pub requests: u64,
 }
@@ -237,9 +251,23 @@ impl WorkerReport {
             http_handshake: new_hist(),
             status_codes: HashMap::new(),
             errors: HashMap::new(),
+            per_op: HashMap::new(),
             bytes: 0,
             requests: 0,
         }
+    }
+
+    /// Record a successful op with its label, e.g. "GET" or "tpcb-update".
+    /// Bumps both the per-op histogram and the global `total` histogram so
+    /// the dashboard's primary latency line still aggregates everything.
+    pub fn record_op(&mut self, op: &str, total_us: u64) {
+        record_us(&mut self.total, total_us);
+        let h = self
+            .per_op
+            .entry(op.to_string())
+            .or_insert_with(new_hist);
+        record_us(h, total_us);
+        self.requests += 1;
     }
 
     pub fn record_request(
@@ -305,6 +333,7 @@ pub struct FinalReport {
     pub http_handshake: Histogram<u64>,
     pub status_codes: HashMap<u16, u64>,
     pub errors: HashMap<String, u64>,
+    pub per_op: HashMap<String, Histogram<u64>>,
     pub bytes: u64,
     pub requests: u64,
     pub success: u64,
@@ -329,6 +358,7 @@ impl FinalReport {
         let mut http_handshake = new_hist();
         let mut status_codes: HashMap<u16, u64> = HashMap::new();
         let mut errors: HashMap<String, u64> = HashMap::new();
+        let mut per_op: HashMap<String, Histogram<u64>> = HashMap::new();
         let mut bytes = 0u64;
         let mut requests = 0u64;
         let mut success = 0u64;
@@ -347,6 +377,10 @@ impl FinalReport {
             }
             for (k, v) in r.errors {
                 *errors.entry(k).or_insert(0) += v;
+            }
+            for (op, hist) in r.per_op {
+                let dst = per_op.entry(op).or_insert_with(new_hist);
+                dst.add(&hist).ok();
             }
             bytes += r.bytes;
             requests += r.requests;
@@ -373,6 +407,7 @@ impl FinalReport {
             http_handshake,
             status_codes,
             errors,
+            per_op,
             bytes,
             requests,
             success,
@@ -472,6 +507,12 @@ pub fn render_final(r: &FinalReport) -> String {
         BenchKind::Ping => {
             req_rows.push(("Round-trip time   ", &r.total));
         }
+        BenchKind::Redis | BenchKind::Memcache => {
+            req_rows.push(("Op latency        ", &r.total));
+        }
+        BenchKind::Postgres | BenchKind::Mysql => {
+            req_rows.push(("Transaction time  ", &r.total));
+        }
     }
     if !conn_rows.is_empty() {
         out.push_str("\nConnection phases (per connection):\n");
@@ -485,6 +526,36 @@ pub fn render_final(r: &FinalReport) -> String {
         };
         out.push_str(header);
         out.push_str(&phase_table(&req_rows));
+    }
+
+    if !r.per_op.is_empty() {
+        out.push_str("\nPer-operation latency:\n");
+        let mut ops: Vec<(&String, &Histogram<u64>)> = r.per_op.iter().collect();
+        // Sort by total count descending so heaviest ops list first.
+        ops.sort_by(|a, b| b.1.len().cmp(&a.1.len()));
+        let rows: Vec<(&str, &Histogram<u64>)> = ops
+            .iter()
+            .map(|(name, h)| (name.as_str(), *h))
+            .collect();
+        // Reuse the existing aligned phase_table renderer.
+        let labelled: Vec<(&str, &Histogram<u64>)> = rows;
+        out.push_str(&format!(
+            "  {:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+            "op", "count", "min", "mean", "p50", "p95", "p99", "max"
+        ));
+        for (name, h) in &labelled {
+            out.push_str(&format!(
+                "  {:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}\n",
+                name,
+                h.len(),
+                short_dur(h.min()),
+                short_dur(h.mean() as u64),
+                short_dur(h.value_at_quantile(0.50)),
+                short_dur(h.value_at_quantile(0.95)),
+                short_dur(h.value_at_quantile(0.99)),
+                short_dur(h.max()),
+            ));
+        }
     }
 
     if r.total.len() > 0 {

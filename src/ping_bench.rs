@@ -87,6 +87,7 @@ async fn run_worker(
         if try_reserve_budget(&h.remaining).is_none() {
             break;
         }
+        h.rate_gate().await;
         let start = Instant::now();
         match pinger.ping(PingSequence(seq), &payload).await {
             Ok((_packet, rtt)) => {

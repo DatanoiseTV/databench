@@ -23,6 +23,8 @@ use tokio::task::JoinHandle;
 
 mod dns_bench;
 mod ping_bench;
+mod ratelimit;
+mod redis_bench;
 mod stats;
 mod tcp_bench;
 mod tls;
@@ -66,6 +68,11 @@ struct Cli {
     /// Disable the live ratatui dashboard (still prints the final report).
     #[arg(long = "no-tui", global = true)]
     no_tui: bool,
+
+    /// Cap total throughput at this many probes per second (token-bucket).
+    /// Applies across all workers. Useful for gentle production probing.
+    #[arg(long = "qps", global = true)]
+    qps: Option<f64>,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -80,6 +87,8 @@ enum Cmd {
     Dns(DnsArgs),
     /// TLS handshake-only benchmark.
     Tls(TlsArgs),
+    /// Redis benchmark (sandboxed by default; `--cmd` for custom).
+    Redis(RedisArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -134,6 +143,44 @@ struct DnsArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct RedisArgs {
+    /// host[:port], or full redis:// / rediss:// URL.
+    target: String,
+    /// Redis DB number to sandbox into. Default 15 (least likely to collide).
+    #[arg(long = "db", default_value_t = 15)]
+    db: u8,
+    /// AUTH username (Redis 6+ ACL).
+    #[arg(long = "user")]
+    user: Option<String>,
+    /// AUTH password. Prefer the env var to keep it out of `ps`.
+    #[arg(long = "password", env = "DATABENCH_REDIS_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+    /// Force TLS even if the URL doesn't say rediss://.
+    #[arg(long = "tls")]
+    tls: bool,
+    /// Workload preset: read | mixed | write. Default `mixed`.
+    #[arg(long = "workload", default_value = "mixed")]
+    workload: String,
+    /// Number of keys to seed in the sandbox.
+    #[arg(long = "seed-keys", default_value_t = 10_000)]
+    seed_keys: usize,
+    /// Value size (bytes) for seeded keys.
+    #[arg(long = "seed-value-size", default_value_t = 256)]
+    seed_value_size: usize,
+    /// TTL on every seeded key, in seconds. Belt-and-suspenders cleanup.
+    #[arg(long = "seed-ttl", default_value_t = 3600)]
+    seed_ttl: u64,
+    /// Run a custom command on every probe (e.g. `--cmd "GET foo"`).
+    /// Bypasses the workload mix.
+    #[arg(long = "cmd")]
+    cmd: Option<String>,
+    /// Skip sandbox setup and cleanup. Use with --cmd or --workload read
+    /// against an existing dataset.
+    #[arg(long = "no-sandbox")]
+    no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 struct TlsArgs {
     /// host:port.
     target: String,
@@ -163,6 +210,41 @@ struct DisplayInfo {
     detail: String,
     threads: usize,
     connections: usize,
+}
+
+/// Describes how to undo whatever a bench module created at setup time
+/// (seed keys, temp schemas, etc.). Always runs once after workers join,
+/// even on Ctrl-C.
+enum Cleanup {
+    None,
+    Redis {
+        url: String,
+        prefix: String,
+    },
+}
+
+impl Cleanup {
+    async fn run(self) -> Result<()> {
+        match self {
+            Cleanup::None => Ok(()),
+            Cleanup::Redis { url, prefix } => {
+                let (_, mut conn) = redis_bench::connect(&url).await?;
+                let cfg = redis_bench::RedisConfig {
+                    url: url.clone(),
+                    prefix: prefix.clone(),
+                    workload: redis_bench::RedisWorkload::Read,
+                    seed_keys: 0,
+                    seed_value_size: 0,
+                    seed_ttl: Duration::from_secs(0),
+                    timeout: Duration::from_secs(30),
+                    custom: None,
+                };
+                let n = redis_bench::cleanup_sandbox(&cfg, &mut conn).await?;
+                eprintln!("databench: cleaned up {n} redis keys with prefix '{prefix}'");
+                Ok(())
+            }
+        }
+    }
 }
 
 async fn async_main(cli: Cli, threads: usize) -> Result<()> {
@@ -198,22 +280,44 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         });
     }
 
+    let qps = cli.qps.and_then(ratelimit::RateLimiter::from_qps);
     let h = WorkerHandles {
         stop: stop.clone(),
         remaining: remaining.clone(),
         live: live.clone(),
+        qps,
     };
 
     let started_at = Instant::now();
 
-    let (kind, display, handles): (BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>) =
-        match cli.cmd.clone() {
-            Cmd::Http(args) => spawn_http(&cli, args, h.clone(), proto_observed.clone()).await?,
-            Cmd::Ping(args) => spawn_ping(&cli, args, h.clone()).await?,
-            Cmd::Tcp(args) => spawn_tcp(&cli, args, h.clone())?,
-            Cmd::Dns(args) => spawn_dns(&cli, args, h.clone())?,
-            Cmd::Tls(args) => spawn_tls(&cli, args, h.clone(), proto_observed.clone())?,
-        };
+    let (kind, display, handles, cleanup): (
+        BenchKind,
+        DisplayInfo,
+        Vec<JoinHandle<WorkerReport>>,
+        Cleanup,
+    ) = match cli.cmd.clone() {
+        Cmd::Http(args) => {
+            let (k, d, h2) = spawn_http(&cli, args, h.clone(), proto_observed.clone()).await?;
+            (k, d, h2, Cleanup::None)
+        }
+        Cmd::Ping(args) => {
+            let (k, d, h2) = spawn_ping(&cli, args, h.clone()).await?;
+            (k, d, h2, Cleanup::None)
+        }
+        Cmd::Tcp(args) => {
+            let (k, d, h2) = spawn_tcp(&cli, args, h.clone())?;
+            (k, d, h2, Cleanup::None)
+        }
+        Cmd::Dns(args) => {
+            let (k, d, h2) = spawn_dns(&cli, args, h.clone())?;
+            (k, d, h2, Cleanup::None)
+        }
+        Cmd::Tls(args) => {
+            let (k, d, h2) = spawn_tls(&cli, args, h.clone(), proto_observed.clone())?;
+            (k, d, h2, Cleanup::None)
+        }
+        Cmd::Redis(args) => spawn_redis(&cli, args, h.clone()).await?,
+    };
 
     let display = DisplayInfo {
         threads,
@@ -255,6 +359,10 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         }
     }
 
+    if let Err(e) = cleanup.run().await {
+        eprintln!("databench: cleanup failed: {e}");
+    }
+
     let total_duration = started_at.elapsed();
     let default_proto: &'static str = match kind {
         BenchKind::Http => "HTTP/1.1",
@@ -262,6 +370,10 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         BenchKind::Tcp => "TCP",
         BenchKind::Dns => "DNS (system resolver)",
         BenchKind::Tls => "TLS",
+        BenchKind::Redis => "RESP",
+        BenchKind::Postgres => "PostgreSQL wire",
+        BenchKind::Mysql => "MySQL wire",
+        BenchKind::Memcache => "memcached text",
     };
     let protocol = proto_observed.lock().unwrap_or(default_proto);
     let final_report =
@@ -410,6 +522,101 @@ fn spawn_dns(
         },
         handles,
     ))
+}
+
+async fn spawn_redis(
+    cli: &Cli,
+    args: RedisArgs,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let url = redis_bench::build_url(
+        &args.target,
+        Some(args.db),
+        args.user.as_deref(),
+        args.password.as_deref(),
+        args.tls,
+    );
+
+    let workload = redis_bench::RedisWorkload::parse(&args.workload)?;
+    let custom = args.cmd.as_ref().map(|s| {
+        // crude split — quote-aware would be better, but this is consistent
+        // with what redis-cli sees from the same shell.
+        s.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()
+    });
+
+    let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let prefix = format!("databench:{run_id}:");
+
+    let cfg = Arc::new(redis_bench::RedisConfig {
+        url: url.clone(),
+        prefix: prefix.clone(),
+        workload,
+        seed_keys: args.seed_keys,
+        seed_value_size: args.seed_value_size,
+        seed_ttl: Duration::from_secs(args.seed_ttl),
+        timeout: cli.timeout,
+        custom: custom.clone(),
+    });
+
+    // Smoke probe + sandbox setup before forking workers.
+    let (_client, mut conn) = redis_bench::connect(&url)
+        .await
+        .with_context(|| format!("connecting to redis at {}", redact_url(&url)))?;
+    redis_bench::pre_run_checks(&mut conn).await.ok();
+    let cleanup = if !args.no_sandbox && custom.is_none() {
+        eprintln!(
+            "databench: seeding {} keys (prefix={}, value_size={}B) ...",
+            args.seed_keys, prefix, args.seed_value_size
+        );
+        redis_bench::setup_sandbox(&cfg, &mut conn)
+            .await
+            .context("seeding redis sandbox")?;
+        Cleanup::Redis {
+            url: url.clone(),
+            prefix: prefix.clone(),
+        }
+    } else {
+        Cleanup::None
+    };
+
+    let handles = redis_bench::spawn_workers(cfg.clone(), cli.connections, h);
+
+    let detail = match (&custom, args.no_sandbox) {
+        (Some(c), _) => format!("custom cmd={:?}  db={}", c, args.db),
+        (None, true) => format!("workload={}  no-sandbox  db={}", args.workload, args.db),
+        (None, false) => format!(
+            "workload={}  seed_keys={}  db={}  prefix={}",
+            args.workload, args.seed_keys, args.db, prefix
+        ),
+    };
+
+    Ok((
+        BenchKind::Redis,
+        DisplayInfo {
+            kind: BenchKind::Redis,
+            target: redact_url(&url),
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+        cleanup,
+    ))
+}
+
+/// Strip user:password from a URL-form target so it never lands on stdout.
+fn redact_url(url: &str) -> String {
+    if let Ok(mut u) = url::Url::parse(url) {
+        let _ = u.set_password(None);
+        let _ = u.set_username("");
+        return u.to_string();
+    }
+    url.to_string()
 }
 
 fn spawn_tls(
@@ -871,6 +1078,12 @@ fn draw_body(
         ],
         BenchKind::Dns => vec![phase_kv("DNS lookup    ", dns, Color::Magenta)],
         BenchKind::Ping => vec![phase_kv("Round-trip    ", ttfb, Color::Yellow)],
+        BenchKind::Redis | BenchKind::Memcache => {
+            vec![phase_kv("Op RTT        ", ttfb, Color::Yellow)]
+        }
+        BenchKind::Postgres | BenchKind::Mysql => {
+            vec![phase_kv("Txn time      ", ttfb, Color::Yellow)]
+        }
     };
     let phases = Paragraph::new(phase_lines).block(
         Block::default()
@@ -902,6 +1115,8 @@ fn draw_body(
     let title = match kind {
         BenchKind::Http => " responses ",
         BenchKind::Ping => " pings ",
+        BenchKind::Redis | BenchKind::Memcache => " ops ",
+        BenchKind::Postgres | BenchKind::Mysql => " txns ",
         _ => " probes ",
     };
     let status = Paragraph::new(status_lines)

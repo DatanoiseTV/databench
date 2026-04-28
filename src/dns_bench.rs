@@ -38,6 +38,7 @@ async fn run_worker(cfg: Arc<DnsConfig>, h: WorkerHandles) -> WorkerReport {
         if try_reserve_budget(&h.remaining).is_none() {
             break;
         }
+        h.rate_gate().await;
         match probe(&cfg).await {
             Ok(dns_us) => {
                 report.record_phase(PhaseKind::Dns, dns_us);

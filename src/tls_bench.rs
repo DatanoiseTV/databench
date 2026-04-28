@@ -58,6 +58,7 @@ async fn run_worker(
         if try_reserve_budget(&h.remaining).is_none() {
             break;
         }
+        h.rate_gate().await;
         match probe(&cfg, &connector).await {
             Ok((dns_us, tcp_us, tls_us, proto)) => {
                 let total = dns_us + tcp_us + tls_us;

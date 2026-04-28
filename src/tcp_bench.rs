@@ -39,6 +39,7 @@ async fn run_worker(cfg: Arc<TcpConfig>, h: WorkerHandles) -> WorkerReport {
         if try_reserve_budget(&h.remaining).is_none() {
             break;
         }
+        h.rate_gate().await;
         match probe(&cfg).await {
             Ok((dns_us, tcp_us)) => {
                 let total = dns_us + tcp_us;
