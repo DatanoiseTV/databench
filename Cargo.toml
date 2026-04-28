@@ -1,12 +1,12 @@
 [package]
-name = "httpbenchy"
+name = "databench"
 version = "0.1.0"
 edition = "2021"
-description = "Ultra-fast HTTP(S) benchmark, like ab/wrk/oha"
+description = "Multi-protocol network benchmark: HTTP(S), ICMP ping, TCP, DNS, TLS"
 license = "MIT OR Apache-2.0"
 
 [[bin]]
-name = "httpbenchy"
+name = "databench"
 path = "src/main.rs"
 
 [dependencies]
@@ -27,6 +27,9 @@ num_cpus = "1"
 anyhow = "1"
 parking_lot = "0.12"
 ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+surge-ping = "0.8"
+socket2 = "0.6"
+rand = "0.8"
 
 [profile.release]
 opt-level = 3

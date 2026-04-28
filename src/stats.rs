@@ -4,6 +4,47 @@ use std::time::Duration;
 
 use hdrhistogram::Histogram;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchKind {
+    Http,
+    Ping,
+    Tcp,
+    Dns,
+    Tls,
+}
+
+impl BenchKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            BenchKind::Http => "HTTP",
+            BenchKind::Ping => "ICMP ping",
+            BenchKind::Tcp => "TCP connect",
+            BenchKind::Dns => "DNS lookup",
+            BenchKind::Tls => "TLS handshake",
+        }
+    }
+
+    pub fn unit(self) -> &'static str {
+        match self {
+            BenchKind::Http => "req",
+            BenchKind::Ping => "ping",
+            BenchKind::Tcp => "conn",
+            BenchKind::Dns => "lookup",
+            BenchKind::Tls => "handshake",
+        }
+    }
+
+    pub fn unit_plural(self) -> &'static str {
+        match self {
+            BenchKind::Http => "reqs",
+            BenchKind::Ping => "pings",
+            BenchKind::Tcp => "conns",
+            BenchKind::Dns => "lookups",
+            BenchKind::Tls => "handshakes",
+        }
+    }
+}
+
 /// Atomic counters updated by every worker on every request.
 /// Used for live progress and the final summary.
 #[derive(Debug, Default)]
@@ -82,6 +123,17 @@ impl LiveStats {
         self.body_count.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_phase_live(&self, phase: PhaseKind, us: u64) {
+        let (sum, count) = match phase {
+            PhaseKind::Dns => (&self.dns_us_sum, &self.dns_count),
+            PhaseKind::Tcp => (&self.tcp_us_sum, &self.tcp_count),
+            PhaseKind::Tls => (&self.tls_us_sum, &self.tls_count),
+            PhaseKind::HttpHandshake => (&self.hs_us_sum, &self.hs_count),
+        };
+        sum.fetch_add(us, Ordering::Relaxed);
+        count.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_status(&self, status: u16) {
         let counter = match status / 100 {
             1 => &self.status_1xx,
@@ -138,6 +190,14 @@ pub struct PhaseConnect {
     pub tcp_us: u64,
     pub tls_us: Option<u64>,
     pub hs_us: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PhaseKind {
+    Dns,
+    Tcp,
+    Tls,
+    HttpHandshake,
 }
 
 /// Per-worker results, merged into a `FinalReport` at the end.
@@ -198,6 +258,24 @@ impl WorkerReport {
         self.requests += 1;
     }
 
+    /// Generic per-probe success record. Used by ping/tcp/dns/tls modes.
+    pub fn record_probe(&mut self, total_us: u64) {
+        record_us(&mut self.total, total_us);
+        self.requests += 1;
+    }
+
+    /// Records a single per-phase timing into the named histogram. Used by
+    /// non-HTTP probes that have a single phase of interest.
+    pub fn record_phase(&mut self, phase: PhaseKind, us: u64) {
+        let h = match phase {
+            PhaseKind::Dns => &mut self.dns,
+            PhaseKind::Tcp => &mut self.tcp,
+            PhaseKind::Tls => &mut self.tls,
+            PhaseKind::HttpHandshake => &mut self.http_handshake,
+        };
+        record_us(h, us);
+    }
+
     pub fn record_connection(&mut self, m: &PhaseConnect) {
         record_us(&mut self.dns, m.dns_us);
         record_us(&mut self.tcp, m.tcp_us);
@@ -216,6 +294,7 @@ impl WorkerReport {
 }
 
 pub struct FinalReport {
+    pub kind: BenchKind,
     pub total_duration: Duration,
     pub total: Histogram<u64>,
     pub ttfb: Histogram<u64>,
@@ -235,6 +314,7 @@ pub struct FinalReport {
 
 impl FinalReport {
     pub fn from_workers(
+        kind: BenchKind,
         reports: Vec<WorkerReport>,
         total_duration: Duration,
         connections: usize,
@@ -272,7 +352,17 @@ impl FinalReport {
             requests += r.requests;
         }
 
+        // For non-HTTP modes there are no status codes, so derive `success`
+        // from total minus failures.
+        let success = if status_codes.is_empty() {
+            let err_total: u64 = errors.values().sum();
+            requests.saturating_sub(err_total)
+        } else {
+            success
+        };
+
         Self {
+            kind,
             total_duration,
             total,
             ttfb,
@@ -321,52 +411,91 @@ pub fn render_final(r: &FinalReport) -> String {
     let throughput = r.bytes as f64 / total_secs.max(f64::EPSILON);
 
     out.push_str("\nSummary:\n");
+    out.push_str(&format!("  Mode:           {}\n", r.kind.label()));
     out.push_str(&format!("  Protocol:       {}\n", r.protocol));
-    out.push_str(&format!("  Connections:    {}\n", r.connections));
+    out.push_str(&format!("  Workers:        {}\n", r.connections));
     out.push_str(&format!("  Total time:     {:.4} s\n", total_secs));
-    out.push_str(&format!("  Total requests: {}\n", r.requests));
+    let unit_label = format!("Total {}:", r.kind.unit_plural());
+    out.push_str(&format!("  {:<18}{}\n", unit_label, r.requests));
     out.push_str(&format!("  Successful:     {}\n", r.success));
-    out.push_str(&format!(
-        "  Errors:         {}\n",
-        r.errors.values().sum::<u64>()
-    ));
-    out.push_str(&format!("  Requests/sec:   {:.2}\n", rps));
-    out.push_str(&format!(
-        "  Throughput:     {}/s\n",
-        fmt_bytes(throughput as u64)
-    ));
-    out.push_str(&format!("  Total data:     {}\n", fmt_bytes(r.bytes)));
-    if r.success > 0 {
+    let total_errors: u64 = r.errors.values().sum();
+    out.push_str(&format!("  Errors:         {}\n", total_errors));
+    if matches!(r.kind, BenchKind::Ping) && r.requests > 0 {
+        let loss_pct = total_errors as f64 / r.requests as f64 * 100.0;
+        out.push_str(&format!("  Packet loss:    {:.2}%\n", loss_pct));
+    }
+    let rate_label = format!("{}/sec:", r.kind.unit_plural());
+    out.push_str(&format!("  {:<18}{:.2}\n", rate_label, rps));
+    if r.bytes > 0 {
         out.push_str(&format!(
-            "  Size/request:   {}\n",
-            fmt_bytes(r.bytes / r.success.max(1))
+            "  Throughput:     {}/s\n",
+            fmt_bytes(throughput as u64)
         ));
+        out.push_str(&format!("  Total data:     {}\n", fmt_bytes(r.bytes)));
+        if r.success > 0 {
+            out.push_str(&format!(
+                "  Size/request:   {}\n",
+                fmt_bytes(r.bytes / r.success.max(1))
+            ));
+        }
     }
 
-    out.push_str("\nConnection phases (per connection):\n");
-    out.push_str(&phase_table(&[
-        ("DNS lookup    ", &r.dns),
-        ("TCP connect   ", &r.tcp),
-        ("TLS handshake ", &r.tls),
-        ("HTTP handshake", &r.http_handshake),
-    ]));
-
-    out.push_str("\nRequest phases (per request):\n");
-    out.push_str(&phase_table(&[
-        ("Time to first byte", &r.ttfb),
-        ("Body download     ", &r.body_dl),
-        ("Total             ", &r.total),
-    ]));
+    // Phase tables — only render the rows that actually applied for this
+    // bench kind so DNS/TLS rows don't show "—" for an HTTP-less probe.
+    let mut conn_rows: Vec<(&str, &Histogram<u64>)> = Vec::new();
+    let mut req_rows: Vec<(&str, &Histogram<u64>)> = Vec::new();
+    match r.kind {
+        BenchKind::Http => {
+            conn_rows.push(("DNS lookup    ", &r.dns));
+            conn_rows.push(("TCP connect   ", &r.tcp));
+            conn_rows.push(("TLS handshake ", &r.tls));
+            conn_rows.push(("HTTP handshake", &r.http_handshake));
+            req_rows.push(("Time to first byte", &r.ttfb));
+            req_rows.push(("Body download     ", &r.body_dl));
+            req_rows.push(("Total             ", &r.total));
+        }
+        BenchKind::Tls => {
+            conn_rows.push(("DNS lookup    ", &r.dns));
+            conn_rows.push(("TCP connect   ", &r.tcp));
+            conn_rows.push(("TLS handshake ", &r.tls));
+            req_rows.push(("Total             ", &r.total));
+        }
+        BenchKind::Tcp => {
+            conn_rows.push(("DNS lookup    ", &r.dns));
+            conn_rows.push(("TCP connect   ", &r.tcp));
+            req_rows.push(("Total             ", &r.total));
+        }
+        BenchKind::Dns => {
+            conn_rows.push(("DNS lookup    ", &r.dns));
+            req_rows.push(("Total             ", &r.total));
+        }
+        BenchKind::Ping => {
+            req_rows.push(("Round-trip time   ", &r.total));
+        }
+    }
+    if !conn_rows.is_empty() {
+        out.push_str("\nConnection phases (per connection):\n");
+        out.push_str(&phase_table(&conn_rows));
+    }
+    if !req_rows.is_empty() {
+        let header = match r.kind {
+            BenchKind::Ping => "\nPer-probe timings:\n",
+            BenchKind::Http => "\nRequest phases (per request):\n",
+            _ => "\nPer-probe timings:\n",
+        };
+        out.push_str(header);
+        out.push_str(&phase_table(&req_rows));
+    }
 
     if r.total.len() > 0 {
-        out.push_str("\nLatency distribution (total):\n");
+        out.push_str("\nLatency distribution:\n");
         for &p in &[10.0, 25.0, 50.0, 75.0, 90.0, 95.0, 99.0, 99.9, 99.99] {
             let v = r.total.value_at_quantile(p / 100.0);
             out.push_str(&format!("  {:>6}%: {}\n", format_pct(p), fmt_duration_us(v)));
         }
 
         out.push_str(&format!(
-            "\nResponse time histogram (total latency vs count):\n{}",
+            "\nLatency histogram:\n{}",
             render_histogram(&r.total)
         ));
     }

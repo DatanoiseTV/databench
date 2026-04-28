@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use http::{HeaderName, HeaderValue, Uri};
 use parking_lot::Mutex;
 use ratatui::crossterm::{
@@ -15,82 +15,138 @@ use ratatui::crossterm::{
 };
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
 use ratatui::symbols::Marker;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Axis, Block, Borders, Chart, Dataset, Gauge, GraphType, Paragraph};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::task::JoinHandle;
 
+mod dns_bench;
+mod ping_bench;
 mod stats;
+mod tcp_bench;
 mod tls;
+mod tls_bench;
 mod worker;
 
-use stats::{render_final, FinalReport, LiveSnapshot, LiveStats, WorkerReport};
-use worker::{run_worker, Scheme, Target, WorkerConfig, WorkerHandles};
+use stats::{render_final, BenchKind, FinalReport, LiveSnapshot, LiveStats, WorkerReport};
+use worker::{run_worker as run_http_worker, Scheme, Target, WorkerConfig, WorkerHandles};
 
-#[derive(Parser, Debug, Clone)]
+#[derive(Parser, Debug)]
 #[command(
-    name = "httpbenchy",
+    name = "databench",
     version,
-    about = "Ultra-fast HTTP(S) benchmark with a live ratatui dashboard",
+    about = "Multi-protocol network benchmark — HTTP(S), ICMP ping, TCP, DNS, TLS",
     long_about = None
 )]
 struct Cli {
-    /// Target URL (http:// or https://)
-    url: String,
+    #[command(subcommand)]
+    cmd: Cmd,
 
-    /// Number of concurrent connections.
-    #[arg(short = 'c', long = "connections", default_value_t = 50)]
+    /// Number of concurrent workers (connections / probes in flight).
+    #[arg(short = 'c', long = "connections", default_value_t = 50, global = true)]
     connections: usize,
 
-    /// Total number of requests (overrides --duration).
-    #[arg(short = 'n', long = "requests")]
+    /// Total number of probes (overrides --duration).
+    #[arg(short = 'n', long = "requests", global = true)]
     requests: Option<u64>,
 
-    /// Benchmark duration, e.g. 10s, 1m, 30s. Defaults to 10s if neither -n nor -z is given.
-    #[arg(short = 'z', long = "duration", value_parser = humantime::parse_duration)]
+    /// Benchmark duration, e.g. 10s, 1m. Defaults to 10s if neither -n nor -z is given.
+    #[arg(short = 'z', long = "duration", value_parser = humantime::parse_duration, global = true)]
     duration: Option<Duration>,
 
+    /// Per-probe timeout.
+    #[arg(long = "timeout", value_parser = humantime::parse_duration, default_value = "30s", global = true)]
+    timeout: Duration,
+
+    /// Tokio worker threads (defaults to number of CPUs).
+    #[arg(short = 't', long = "threads", global = true)]
+    threads: Option<usize>,
+
+    /// Disable the live ratatui dashboard (still prints the final report).
+    #[arg(long = "no-tui", global = true)]
+    no_tui: bool,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum Cmd {
+    /// HTTP(S) benchmark.
+    Http(HttpArgs),
+    /// ICMP echo (ping) benchmark.
+    Ping(PingArgs),
+    /// TCP connect-time benchmark.
+    Tcp(TcpArgs),
+    /// DNS lookup benchmark (system resolver).
+    Dns(DnsArgs),
+    /// TLS handshake-only benchmark.
+    Tls(TlsArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+struct HttpArgs {
+    /// Target URL (http:// or https://).
+    url: String,
     /// HTTP method.
     #[arg(short = 'm', long = "method", default_value = "GET")]
     method: String,
-
     /// Request header (repeatable): -H "Name: Value".
     #[arg(short = 'H', long = "header")]
     headers: Vec<String>,
-
     /// Request body as a literal string.
     #[arg(short = 'd', long = "body")]
     body: Option<String>,
-
-    /// Per-request timeout (connect + send + body).
-    #[arg(long = "timeout", value_parser = humantime::parse_duration, default_value = "30s")]
-    timeout: Duration,
-
     /// Skip TLS certificate verification (DANGEROUS — testing only).
     #[arg(short = 'k', long = "insecure")]
     insecure: bool,
-
     /// Force HTTP/2 (h2c for plaintext, ALPN-first for TLS).
     #[arg(long = "http2")]
     http2: bool,
-
     /// Disable HTTP keep-alive (one request per connection).
     #[arg(long = "no-keepalive")]
     no_keepalive: bool,
+}
 
-    /// Tokio worker threads (defaults to number of CPUs).
-    #[arg(short = 't', long = "threads")]
-    threads: Option<usize>,
+#[derive(Args, Debug, Clone)]
+struct PingArgs {
+    /// Hostname or IP to ping.
+    host: String,
+    /// Payload size in bytes.
+    #[arg(short = 's', long = "size", default_value_t = 56)]
+    size: usize,
+    /// IP TTL.
+    #[arg(long = "ttl")]
+    ttl: Option<u32>,
+    /// Prefer IPv6 when resolving.
+    #[arg(short = '6', long = "ipv6")]
+    ipv6: bool,
+}
 
-    /// Disable the live ratatui dashboard (still prints final report).
-    #[arg(long = "no-tui")]
-    no_tui: bool,
+#[derive(Args, Debug, Clone)]
+struct TcpArgs {
+    /// host:port.
+    target: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct DnsArgs {
+    /// Hostname to resolve.
+    name: String,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TlsArgs {
+    /// host:port.
+    target: String,
+    /// SNI override.
+    #[arg(long = "sni")]
+    sni: Option<String>,
+    /// Skip TLS certificate verification (DANGEROUS — testing only).
+    #[arg(short = 'k', long = "insecure")]
+    insecure: bool,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-
     tls::install_default_provider();
 
     let threads = cli.threads.unwrap_or_else(num_cpus::get).max(1);
@@ -98,19 +154,18 @@ fn main() -> Result<()> {
         .worker_threads(threads)
         .enable_all()
         .build()?;
-
     runtime.block_on(async_main(cli, threads))
 }
 
-async fn async_main(cli: Cli, threads: usize) -> Result<()> {
-    let target = parse_target(&cli.url)?;
-    let method: http::Method = cli
-        .method
-        .parse()
-        .with_context(|| format!("invalid HTTP method: {}", cli.method))?;
-    let headers = parse_headers(&cli.headers)?;
-    let body = cli.body.clone().unwrap_or_default().into_bytes().into();
+struct DisplayInfo {
+    kind: BenchKind,
+    target: String,
+    detail: String,
+    threads: usize,
+    connections: usize,
+}
 
+async fn async_main(cli: Cli, threads: usize) -> Result<()> {
     if cli.requests.is_some() && cli.duration.is_some() {
         eprintln!("note: --requests overrides --duration");
     }
@@ -119,17 +174,6 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         (None, Some(d)) => (Some(d), -1i64),
         (None, None) => (Some(Duration::from_secs(10)), -1i64),
     };
-
-    let cfg = Arc::new(WorkerConfig {
-        target: Arc::new(target),
-        method,
-        headers: Arc::new(headers),
-        body,
-        timeout: cli.timeout,
-        keepalive: !cli.no_keepalive,
-        force_h2: cli.http2,
-        insecure: cli.insecure,
-    });
 
     let live = Arc::new(LiveStats::default());
     let stop = Arc::new(AtomicBool::new(false));
@@ -154,28 +198,33 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         });
     }
 
+    let h = WorkerHandles {
+        stop: stop.clone(),
+        remaining: remaining.clone(),
+        live: live.clone(),
+    };
+
     let started_at = Instant::now();
 
-    // Spawn workers.
-    let mut handles: Vec<JoinHandle<WorkerReport>> = Vec::with_capacity(cli.connections);
-    for _ in 0..cli.connections {
-        let cfg = cfg.clone();
-        let h = WorkerHandles {
-            stop: stop.clone(),
-            remaining: remaining.clone(),
-            live: live.clone(),
+    let (kind, display, handles): (BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>) =
+        match cli.cmd.clone() {
+            Cmd::Http(args) => spawn_http(&cli, args, h.clone(), proto_observed.clone()).await?,
+            Cmd::Ping(args) => spawn_ping(&cli, args, h.clone()).await?,
+            Cmd::Tcp(args) => spawn_tcp(&cli, args, h.clone())?,
+            Cmd::Dns(args) => spawn_dns(&cli, args, h.clone())?,
+            Cmd::Tls(args) => spawn_tls(&cli, args, h.clone(), proto_observed.clone())?,
         };
-        let proto = proto_observed.clone();
-        handles.push(tokio::spawn(async move { run_worker(cfg, h, proto).await }));
-    }
+
+    let display = DisplayInfo {
+        threads,
+        ..display
+    };
 
     // Live UI.
     let use_tui = !cli.no_tui && stdout().is_terminal();
     if use_tui {
         run_tui(
-            &cli,
-            &cfg,
-            threads,
+            &display,
             started_at,
             duration,
             cli.requests,
@@ -187,7 +236,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         .await?;
     } else {
         run_plain(
-            &cli,
+            kind,
             started_at,
             duration,
             cli.requests,
@@ -198,26 +247,206 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         .await;
     }
 
-    // Drain results (workers should be at-or-near completion at this point).
     stop.store(true, Ordering::Relaxed);
     let mut reports = Vec::with_capacity(handles.len());
     for h in handles {
-        match h.await {
-            Ok(r) => reports.push(r),
-            Err(_) => {}
+        if let Ok(r) = h.await {
+            reports.push(r);
         }
     }
 
     let total_duration = started_at.elapsed();
-    let protocol = proto_observed.lock().unwrap_or("HTTP/1.1");
-    let final_report = FinalReport::from_workers(reports, total_duration, cli.connections, protocol);
+    let default_proto: &'static str = match kind {
+        BenchKind::Http => "HTTP/1.1",
+        BenchKind::Ping => "ICMP",
+        BenchKind::Tcp => "TCP",
+        BenchKind::Dns => "DNS (system resolver)",
+        BenchKind::Tls => "TLS",
+    };
+    let protocol = proto_observed.lock().unwrap_or(default_proto);
+    let final_report =
+        FinalReport::from_workers(kind, reports, total_duration, cli.connections, protocol);
 
     print!("{}", render_final(&final_report));
     stdout().flush().ok();
     Ok(())
 }
 
-fn parse_target(input: &str) -> Result<Target> {
+// ---------- bench dispatchers ---------------------------------------------
+
+async fn spawn_http(
+    cli: &Cli,
+    args: HttpArgs,
+    h: WorkerHandles,
+    proto_observed: Arc<Mutex<Option<&'static str>>>,
+) -> Result<(BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>)> {
+    let target = parse_http_target(&args.url)?;
+    let method: http::Method = args
+        .method
+        .parse()
+        .with_context(|| format!("invalid HTTP method: {}", args.method))?;
+    let headers = parse_headers(&args.headers)?;
+    let body = args.body.unwrap_or_default().into_bytes().into();
+
+    let cfg = Arc::new(WorkerConfig {
+        target: Arc::new(target),
+        method: method.clone(),
+        headers: Arc::new(headers),
+        body,
+        timeout: cli.timeout,
+        keepalive: !args.no_keepalive,
+        force_h2: args.http2,
+        insecure: args.insecure,
+    });
+
+    let mut handles: Vec<JoinHandle<WorkerReport>> = Vec::with_capacity(cli.connections);
+    for _ in 0..cli.connections {
+        let cfg = cfg.clone();
+        let h = h.clone();
+        let proto = proto_observed.clone();
+        handles.push(tokio::spawn(async move {
+            run_http_worker(cfg, h, proto).await
+        }));
+    }
+
+    let detail = format!(
+        "method={}  keep-alive={}  http2={}",
+        method.as_str(),
+        if args.no_keepalive { "off" } else { "on" },
+        if args.http2 { "forced" } else { "negotiated" }
+    );
+    Ok((
+        BenchKind::Http,
+        DisplayInfo {
+            kind: BenchKind::Http,
+            target: args.url,
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+    ))
+}
+
+async fn spawn_ping(
+    cli: &Cli,
+    args: PingArgs,
+    h: WorkerHandles,
+) -> Result<(BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>)> {
+    let addr = ping_bench::resolve_target(&args.host, args.ipv6).await?;
+    let client = ping_bench::build_client(addr, args.ttl)?;
+    let cfg = Arc::new(ping_bench::PingConfig {
+        host: args.host.clone(),
+        addr,
+        payload_size: args.size,
+        ttl: args.ttl,
+        timeout: cli.timeout,
+    });
+    let handles =
+        ping_bench::spawn_workers(Arc::new(client), cfg, cli.connections, h);
+    let detail = format!(
+        "addr={}  size={}B{}",
+        addr,
+        args.size,
+        args.ttl.map(|t| format!("  ttl={t}")).unwrap_or_default(),
+    );
+    Ok((
+        BenchKind::Ping,
+        DisplayInfo {
+            kind: BenchKind::Ping,
+            target: args.host,
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+    ))
+}
+
+fn spawn_tcp(
+    cli: &Cli,
+    args: TcpArgs,
+    h: WorkerHandles,
+) -> Result<(BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>)> {
+    let (host, port) = parse_host_port(&args.target)?;
+    let cfg = Arc::new(tcp_bench::TcpConfig {
+        host: host.clone(),
+        port,
+        timeout: cli.timeout,
+    });
+    let handles = tcp_bench::spawn_workers(cfg, cli.connections, h);
+    let detail = format!("host={host}  port={port}");
+    Ok((
+        BenchKind::Tcp,
+        DisplayInfo {
+            kind: BenchKind::Tcp,
+            target: args.target,
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+    ))
+}
+
+fn spawn_dns(
+    cli: &Cli,
+    args: DnsArgs,
+    h: WorkerHandles,
+) -> Result<(BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>)> {
+    let cfg = Arc::new(dns_bench::DnsConfig {
+        name: args.name.clone(),
+        timeout: cli.timeout,
+    });
+    let handles = dns_bench::spawn_workers(cfg, cli.connections, h);
+    Ok((
+        BenchKind::Dns,
+        DisplayInfo {
+            kind: BenchKind::Dns,
+            target: args.name,
+            detail: "system resolver (lookup_host)".to_string(),
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+    ))
+}
+
+fn spawn_tls(
+    cli: &Cli,
+    args: TlsArgs,
+    h: WorkerHandles,
+    proto_observed: Arc<Mutex<Option<&'static str>>>,
+) -> Result<(BenchKind, DisplayInfo, Vec<JoinHandle<WorkerReport>>)> {
+    let (host, port) = parse_host_port(&args.target)?;
+    let cfg = Arc::new(tls_bench::TlsBenchConfig {
+        host: host.clone(),
+        port,
+        sni: args.sni.clone(),
+        insecure: args.insecure,
+        timeout: cli.timeout,
+    });
+    let handles = tls_bench::spawn_workers(cfg, cli.connections, h, proto_observed);
+    let detail = format!(
+        "host={host}  port={port}  sni={}",
+        args.sni.unwrap_or_else(|| host.clone())
+    );
+    Ok((
+        BenchKind::Tls,
+        DisplayInfo {
+            kind: BenchKind::Tls,
+            target: args.target,
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+    ))
+}
+
+// ---------- parsing helpers -----------------------------------------------
+
+fn parse_http_target(input: &str) -> Result<Target> {
     let parsed = url::Url::parse(input).with_context(|| format!("invalid URL: {input}"))?;
     let scheme = match parsed.scheme() {
         "http" => Scheme::Http,
@@ -245,7 +474,12 @@ fn parse_target(input: &str) -> Result<Target> {
         _ => path,
     };
     let path_uri: Uri = path_with_query.parse().context("path uri")?;
-    let full = format!("{}://{}{}", parsed.scheme(), authority, path_uri.path_and_query().map(|p| p.as_str()).unwrap_or(""));
+    let full = format!(
+        "{}://{}{}",
+        parsed.scheme(),
+        authority,
+        path_uri.path_and_query().map(|p| p.as_str()).unwrap_or("")
+    );
     let full_uri: Uri = full.parse().context("full uri")?;
 
     Ok(Target {
@@ -277,11 +511,24 @@ fn parse_headers(raw: &[String]) -> Result<Vec<(HeaderName, HeaderValue)>> {
     Ok(out)
 }
 
+fn parse_host_port(raw: &str) -> Result<(String, u16)> {
+    let (host, port) = raw
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow!("expected host:port, got: {raw}"))?;
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port: {port}"))?;
+    if host.is_empty() {
+        bail!("missing host in {raw}");
+    }
+    Ok((host.to_string(), port))
+}
+
+// ---------- TUI ------------------------------------------------------------
+
 #[allow(clippy::too_many_arguments)]
 async fn run_tui(
-    cli: &Cli,
-    cfg: &Arc<WorkerConfig>,
-    threads: usize,
+    display: &DisplayInfo,
     started_at: Instant,
     duration: Option<Duration>,
     request_target: Option<u64>,
@@ -305,9 +552,7 @@ async fn run_tui(
 
     let result = tui_loop(
         &mut terminal,
-        cli,
-        cfg,
-        threads,
+        display,
         started_at,
         duration,
         request_target,
@@ -322,20 +567,16 @@ async fn run_tui(
     )
     .await;
 
-    // Always restore the terminal even if drawing failed.
     let mut out = stdout();
     let _ = execute!(out, LeaveAlternateScreen);
     let _ = disable_raw_mode();
-
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn tui_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
-    cli: &Cli,
-    cfg: &Arc<WorkerConfig>,
-    threads: usize,
+    display: &DisplayInfo,
     started_at: Instant,
     duration: Option<Duration>,
     request_target: Option<u64>,
@@ -352,7 +593,6 @@ async fn tui_loop(
     let stall_threshold = Duration::from_secs(2);
 
     loop {
-        // Update RPS / bytes-per-second from atomic deltas.
         let now = Instant::now();
         let elapsed_since_tick = now.duration_since(*last_tick).as_secs_f64().max(1e-3);
         let snap = live.snapshot();
@@ -379,9 +619,7 @@ async fn tui_loop(
         terminal.draw(|frame| {
             draw_dashboard(
                 frame,
-                cli,
-                cfg,
-                threads,
+                display,
                 proto_str,
                 elapsed,
                 duration,
@@ -395,7 +633,6 @@ async fn tui_loop(
             );
         })?;
 
-        // Pump keyboard at up to 100 ms.
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -410,11 +647,7 @@ async fn tui_loop(
             }
         }
 
-        if handles.iter().all(|h| h.is_finished()) && stop.load(Ordering::Relaxed) {
-            break;
-        }
         if handles.iter().all(|h| h.is_finished()) {
-            // Workers finished without stop being set (request count reached).
             break;
         }
     }
@@ -424,9 +657,7 @@ async fn tui_loop(
 #[allow(clippy::too_many_arguments)]
 fn draw_dashboard(
     frame: &mut ratatui::Frame<'_>,
-    cli: &Cli,
-    cfg: &Arc<WorkerConfig>,
-    threads: usize,
+    display: &DisplayInfo,
     proto: &'static str,
     elapsed: Duration,
     duration: Option<Duration>,
@@ -442,18 +673,19 @@ fn draw_dashboard(
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),  // header
-            Constraint::Length(3),  // progress
-            Constraint::Length(8),  // body (live + phases + responses)
-            Constraint::Min(10),    // chart (req/s over time)
-            Constraint::Length(1),  // footer
+            Constraint::Length(4),
+            Constraint::Length(3),
+            Constraint::Length(8),
+            Constraint::Min(10),
+            Constraint::Length(1),
         ])
         .split(area);
 
-    draw_header(frame, chunks[0], cli, cfg, threads, proto);
+    draw_header(frame, chunks[0], display, proto);
     draw_progress(
         frame,
         chunks[1],
+        display.kind,
         elapsed,
         duration,
         request_target,
@@ -461,20 +693,29 @@ fn draw_dashboard(
         stalled,
         stalled_for,
     );
-    draw_body(frame, chunks[2], snap, current_rps, current_bps);
-    draw_chart(frame, chunks[3], rps_history, current_rps, stalled);
+    draw_body(frame, chunks[2], display.kind, snap, current_rps, current_bps);
+    draw_chart(
+        frame,
+        chunks[3],
+        display.kind,
+        rps_history,
+        current_rps,
+        stalled,
+    );
     draw_footer(frame, chunks[4]);
 }
 
 fn draw_header(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
-    cli: &Cli,
-    cfg: &Arc<WorkerConfig>,
-    threads: usize,
+    display: &DisplayInfo,
     proto: &'static str,
 ) {
-    let title = format!(" httpbenchy v{} ", env!("CARGO_PKG_VERSION"));
+    let title = format!(
+        " databench v{}  ·  {} ",
+        env!("CARGO_PKG_VERSION"),
+        display.kind.label()
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .title(Span::styled(
@@ -483,23 +724,19 @@ fn draw_header(
         ));
     let line1 = Line::from(vec![
         Span::styled("Target  ", Style::default().fg(Color::DarkGray)),
-        Span::styled(cli.url.clone(), Style::default().fg(Color::White)),
+        Span::styled(display.target.clone(), Style::default().fg(Color::White)),
     ]);
     let line2 = Line::from(vec![
-        Span::styled("Method ", Style::default().fg(Color::DarkGray)),
-        Span::raw(cfg.method.as_str().to_string()),
+        Span::styled(display.detail.clone(), Style::default().fg(Color::Gray)),
         Span::raw("   "),
         Span::styled("Proto ", Style::default().fg(Color::DarkGray)),
         Span::styled(proto, Style::default().fg(Color::Yellow)),
         Span::raw("   "),
-        Span::styled("Conns ", Style::default().fg(Color::DarkGray)),
-        Span::raw(cli.connections.to_string()),
+        Span::styled("Workers ", Style::default().fg(Color::DarkGray)),
+        Span::raw(display.connections.to_string()),
         Span::raw("   "),
         Span::styled("Threads ", Style::default().fg(Color::DarkGray)),
-        Span::raw(threads.to_string()),
-        Span::raw("   "),
-        Span::styled("Keep-alive ", Style::default().fg(Color::DarkGray)),
-        Span::raw(if cfg.keepalive { "on" } else { "off" }),
+        Span::raw(display.threads.to_string()),
     ]);
     let p = Paragraph::new(vec![line1, line2]).block(block);
     frame.render_widget(p, area);
@@ -509,6 +746,7 @@ fn draw_header(
 fn draw_progress(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
+    kind: BenchKind,
     elapsed: Duration,
     duration: Option<Duration>,
     request_target: Option<u64>,
@@ -516,10 +754,11 @@ fn draw_progress(
     stalled: bool,
     stalled_for: Duration,
 ) {
+    let unit = kind.unit_plural();
     let (mut label, ratio) = match (duration, request_target) {
         (_, Some(n)) => {
             let r = (requests as f64 / n.max(1) as f64).clamp(0.0, 1.0);
-            (format!("{}/{}  reqs", fmt_int(requests), fmt_int(n)), r)
+            (format!("{}/{}  {}", fmt_int(requests), fmt_int(n), unit), r)
         }
         (Some(d), _) => {
             let r = (elapsed.as_secs_f64() / d.as_secs_f64().max(1e-9)).clamp(0.0, 1.0);
@@ -530,8 +769,9 @@ fn draw_progress(
 
     let (gauge_color, title) = if stalled {
         label.push_str(&format!(
-            "   ⚠ STALLED for {}s — no completed requests",
-            stalled_for.as_secs()
+            "   ⚠ STALLED for {}s — no completed {}",
+            stalled_for.as_secs(),
+            unit
         ));
         (Color::Red, " progress (stalled) ")
     } else {
@@ -554,6 +794,7 @@ fn draw_progress(
 fn draw_body(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
+    kind: BenchKind,
     snap: LiveSnapshot,
     rps: f64,
     bps: f64,
@@ -567,18 +808,24 @@ fn draw_body(
         ])
         .split(area);
 
-    // Live counters
     let rps_color = if rps > 10_000.0 {
         Color::Green
     } else if rps > 1_000.0 {
         Color::Yellow
+    } else if rps > 0.0 {
+        Color::White
     } else {
         Color::Red
     };
+    let unit = kind.unit_plural();
     let lines = vec![
-        big_kv("Reqs/sec   ", format!("{:>14.1}", rps), rps_color),
+        big_kv(
+            &format!("{}/sec   ", unit),
+            format!("{:>14.1}", rps),
+            rps_color,
+        ),
         big_kv("Bytes/sec  ", format!("{:>14}", fmt_bytes_rate(bps)), Color::Cyan),
-        big_kv("Total reqs ", format!("{:>14}", fmt_int(snap.requests)), Color::White),
+        big_kv("Total      ", format!("{:>14}", fmt_int(snap.requests)), Color::White),
         big_kv("Total data ", format!("{:>14}", fmt_bytes(snap.bytes)), Color::White),
         big_kv("Conns made ", format!("{:>14}", fmt_int(snap.connections)), Color::White),
         big_kv(
@@ -595,7 +842,8 @@ fn draw_body(
         .block(Block::default().borders(Borders::ALL).title(" live "));
     frame.render_widget(live, cols[0]);
 
-    // Phase averages (per connection / per request).
+    // Phase averages — labels filtered by bench kind so unused rows don't
+    // show up as "—".
     let dns = LiveSnapshot::avg(snap.dns_us_sum, snap.dns_count);
     let tcp = LiveSnapshot::avg(snap.tcp_us_sum, snap.tcp_count);
     let tls = LiveSnapshot::avg(snap.tls_us_sum, snap.tls_count);
@@ -603,14 +851,27 @@ fn draw_body(
     let ttfb = LiveSnapshot::avg(snap.ttfb_us_sum, snap.ttfb_count);
     let body = LiveSnapshot::avg(snap.body_us_sum, snap.body_count);
 
-    let phase_lines = vec![
-        phase_kv("DNS lookup    ", dns, Color::Magenta),
-        phase_kv("TCP connect   ", tcp, Color::Blue),
-        phase_kv("TLS handshake ", tls, Color::Cyan),
-        phase_kv("HTTP handshake", hs, Color::Gray),
-        phase_kv("TTFB          ", ttfb, Color::Yellow),
-        phase_kv("Body download ", body, Color::Green),
-    ];
+    let phase_lines: Vec<Line<'static>> = match kind {
+        BenchKind::Http => vec![
+            phase_kv("DNS lookup    ", dns, Color::Magenta),
+            phase_kv("TCP connect   ", tcp, Color::Blue),
+            phase_kv("TLS handshake ", tls, Color::Cyan),
+            phase_kv("HTTP handshake", hs, Color::Gray),
+            phase_kv("TTFB          ", ttfb, Color::Yellow),
+            phase_kv("Body download ", body, Color::Green),
+        ],
+        BenchKind::Tls => vec![
+            phase_kv("DNS lookup    ", dns, Color::Magenta),
+            phase_kv("TCP connect   ", tcp, Color::Blue),
+            phase_kv("TLS handshake ", tls, Color::Cyan),
+        ],
+        BenchKind::Tcp => vec![
+            phase_kv("DNS lookup    ", dns, Color::Magenta),
+            phase_kv("TCP connect   ", tcp, Color::Blue),
+        ],
+        BenchKind::Dns => vec![phase_kv("DNS lookup    ", dns, Color::Magenta)],
+        BenchKind::Ping => vec![phase_kv("Round-trip    ", ttfb, Color::Yellow)],
+    };
     let phases = Paragraph::new(phase_lines).block(
         Block::default()
             .borders(Borders::ALL)
@@ -618,19 +879,33 @@ fn draw_body(
     );
     frame.render_widget(phases, cols[1]);
 
-    // Status code distribution
+    // Right column: HTTP shows status codes, others show ok/err.
     let total = snap.requests.max(1);
     let pct = |n: u64| n as f64 / total as f64 * 100.0;
-    let status_lines = vec![
-        status_line("1xx", snap.status_1xx, pct(snap.status_1xx), Color::Gray),
-        status_line("2xx", snap.status_2xx, pct(snap.status_2xx), Color::Green),
-        status_line("3xx", snap.status_3xx, pct(snap.status_3xx), Color::Cyan),
-        status_line("4xx", snap.status_4xx, pct(snap.status_4xx), Color::Yellow),
-        status_line("5xx", snap.status_5xx, pct(snap.status_5xx), Color::Red),
-        status_line("err", snap.errors, pct(snap.errors), Color::Magenta),
-    ];
+    let status_lines: Vec<Line<'static>> = match kind {
+        BenchKind::Http => vec![
+            status_line("1xx", snap.status_1xx, pct(snap.status_1xx), Color::Gray),
+            status_line("2xx", snap.status_2xx, pct(snap.status_2xx), Color::Green),
+            status_line("3xx", snap.status_3xx, pct(snap.status_3xx), Color::Cyan),
+            status_line("4xx", snap.status_4xx, pct(snap.status_4xx), Color::Yellow),
+            status_line("5xx", snap.status_5xx, pct(snap.status_5xx), Color::Red),
+            status_line("err", snap.errors, pct(snap.errors), Color::Magenta),
+        ],
+        _ => {
+            let ok = snap.requests.saturating_sub(snap.errors);
+            vec![
+                status_line(" ok", ok, pct(ok), Color::Green),
+                status_line("err", snap.errors, pct(snap.errors), Color::Red),
+            ]
+        }
+    };
+    let title = match kind {
+        BenchKind::Http => " responses ",
+        BenchKind::Ping => " pings ",
+        _ => " probes ",
+    };
     let status = Paragraph::new(status_lines)
-        .block(Block::default().borders(Borders::ALL).title(" responses "));
+        .block(Block::default().borders(Borders::ALL).title(title));
     frame.render_widget(status, cols[2]);
 }
 
@@ -687,6 +962,7 @@ fn big_kv(label: &str, value: String, value_color: Color) -> Line<'static> {
 fn draw_chart(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
+    kind: BenchKind,
     rps_history: &VecDeque<u64>,
     current_rps: f64,
     stalled: bool,
@@ -698,8 +974,6 @@ fn draw_chart(
     } else {
         0.0
     };
-    // Round y-axis up to a "nice" ceiling so the chart doesn't bounce on
-    // every tick.
     let y_max = nice_ceiling((peak as f64).max(current_rps).max(1.0));
     let data: Vec<(f64, f64)> = rps_history
         .iter()
@@ -709,14 +983,15 @@ fn draw_chart(
 
     let line_color = if stalled { Color::Red } else { Color::Green };
     let datasets = vec![Dataset::default()
-        .name("req/s")
+        .name(kind.unit_plural())
         .marker(Marker::Braille)
         .graph_type(GraphType::Line)
         .style(Style::default().fg(line_color))
         .data(&data)];
 
     let title = format!(
-        " req/s graph    now {:.0}    avg {:.0}    peak {} ",
+        " {}/sec   now {:.0}    avg {:.0}    peak {} ",
+        kind.unit_plural(),
         current_rps,
         avg,
         fmt_int(peak)
@@ -777,7 +1052,7 @@ fn draw_footer(frame: &mut ratatui::Frame<'_>, area: Rect) {
 }
 
 async fn run_plain(
-    cli: &Cli,
+    kind: BenchKind,
     started_at: Instant,
     duration: Option<Duration>,
     request_target: Option<u64>,
@@ -785,7 +1060,6 @@ async fn run_plain(
     stop: Arc<AtomicBool>,
     handles: &[JoinHandle<WorkerReport>],
 ) {
-    let _ = cli;
     let mut last_snap = LiveSnapshot::default();
     let mut last_tick = Instant::now();
 
@@ -805,8 +1079,9 @@ async fn run_plain(
             _ => fmt_clock(elapsed),
         };
         eprint!(
-            "\r[{}] reqs={:<10} rps={:<10.1} bytes={:<10} errs={:<6}",
+            "\r[{}] {}={:<10} rps={:<10.1} bytes={:<10} errs={:<6}",
             progress,
+            kind.unit_plural(),
             fmt_int(snap.requests),
             rps,
             fmt_bytes(snap.bytes),

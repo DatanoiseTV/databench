@@ -42,11 +42,32 @@ pub struct WorkerConfig {
     pub insecure: bool,
 }
 
+#[derive(Clone)]
 pub struct WorkerHandles {
     pub stop: Arc<AtomicBool>,
     /// Remaining request budget. Negative = unbounded (duration mode).
     pub remaining: Arc<AtomicI64>,
     pub live: Arc<LiveStats>,
+}
+
+/// Try to reserve one unit from the shared request budget. Returns
+/// `Some(())` if the worker may proceed, `None` if the run is finished.
+pub fn try_reserve_budget(remaining: &AtomicI64) -> Option<()> {
+    loop {
+        let prev = remaining.load(Ordering::Relaxed);
+        if prev < 0 {
+            return Some(()); // unbounded
+        }
+        if prev == 0 {
+            return None;
+        }
+        if remaining
+            .compare_exchange(prev, prev - 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return Some(());
+        }
+    }
 }
 
 enum EitherSender {
@@ -142,7 +163,7 @@ pub async fn run_worker(
             // connection (truly broken peer).
             if let Err(e) = sender.ready().await {
                 if requests_on_conn == 0 {
-                    report.record_error(&h.live, &format!("send-ready: {}", e));
+                    report.record_error(&h.live, &format!("send-ready: {}", chain_msg(&e)));
                 }
                 continue 'outer;
             }
@@ -168,7 +189,7 @@ pub async fn run_worker(
             let resp = match tokio::time::timeout(cfg.timeout, sender.send(req)).await {
                 Ok(Ok(r)) => r,
                 Ok(Err(e)) => {
-                    report.record_error(&h.live, &format!("send: {}", e));
+                    report.record_error(&h.live, &format!("send: {}", chain_msg(&e)));
                     continue 'outer;
                 }
                 Err(_) => {
@@ -320,7 +341,7 @@ fn build_request(cfg: &WorkerConfig, full_uri: bool) -> Request<Full<Bytes>> {
         builder = builder.header(http::header::HOST, cfg.target.authority.clone());
     }
     if !has_ua {
-        builder = builder.header(http::header::USER_AGENT, "httpbenchy/0.1");
+        builder = builder.header(http::header::USER_AGENT, "sbch/0.1");
     }
     if !cfg.body.is_empty() && !has_cl {
         builder = builder.header(http::header::CONTENT_LENGTH, cfg.body.len());
@@ -334,7 +355,7 @@ async fn drain_body_with_timeout(mut body: Incoming, timeout: Duration) -> Resul
     let fut = async {
         let mut total = 0u64;
         while let Some(frame) = body.frame().await {
-            let frame = frame.map_err(|e| e.to_string())?;
+            let frame = frame.map_err(|e| chain_msg(&e))?;
             if let Ok(data) = frame.into_data() {
                 total += data.len() as u64;
             }
@@ -348,14 +369,38 @@ async fn drain_body_with_timeout(mut body: Incoming, timeout: Duration) -> Resul
 }
 
 fn classify(e: &anyhow::Error) -> String {
-    // Walk the source chain to find a useful io::ErrorKind label,
-    // otherwise fall back to the message.
+    // Look for a useful io::ErrorKind, but fall through to the actual
+    // message text whenever the kind would just be "other" or
+    // "uncategorized" (which leaks no info).
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e.as_ref());
     while let Some(s) = src {
         if let Some(io) = s.downcast_ref::<std::io::Error>() {
-            return format!("{:?}", io.kind()).to_lowercase();
+            let kind_str = format!("{:?}", io.kind()).to_lowercase();
+            if kind_str != "other" && kind_str != "uncategorized" {
+                return kind_str;
+            }
+            if let Some(inner) = io.get_ref() {
+                return inner.to_string();
+            }
+            return io.to_string();
         }
         src = s.source();
     }
-    e.to_string()
+    chain_msg(e.as_ref())
+}
+
+/// Concatenates the error message and every cause in its source chain so
+/// generic outer messages like "channel closed" are paired with the actual
+/// cause underneath ("broken pipe", "tls handshake failed", etc.).
+pub fn chain_msg(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = vec![e.to_string()];
+    let mut current = e;
+    while let Some(s) = current.source() {
+        let msg = s.to_string();
+        if parts.last().map(String::as_str) != Some(msg.as_str()) {
+            parts.push(msg);
+        }
+        current = s;
+    }
+    parts.join(": ")
 }
