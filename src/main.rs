@@ -23,6 +23,7 @@ use tokio::task::JoinHandle;
 
 mod dns_bench;
 mod ping_bench;
+mod postgres_bench;
 mod ratelimit;
 mod redis_bench;
 mod stats;
@@ -89,6 +90,8 @@ enum Cmd {
     Tls(TlsArgs),
     /// Redis benchmark (sandboxed by default; `--cmd` for custom).
     Redis(RedisArgs),
+    /// PostgreSQL benchmark (TPC-B-lite by default; `--query` for custom).
+    Postgres(PgArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -181,6 +184,34 @@ struct RedisArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct PgArgs {
+    /// Connection target: full `postgresql://user:pass@host:port/db` URL,
+    /// or just `host[:port]`.
+    target: String,
+    /// Database to connect to for setup. The sandbox is created INSIDE
+    /// this database if we lack CREATE DATABASE permission.
+    #[arg(long = "db", default_value = "postgres")]
+    db: String,
+    #[arg(long = "user", default_value = "postgres")]
+    user: String,
+    #[arg(long = "password", env = "DATABENCH_PG_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+    /// pgbench scale factor. 1 → 100k accounts, 10 tellers, 1 branch.
+    #[arg(long = "scale", default_value_t = 1)]
+    scale: i32,
+    /// Workload preset: select-only | tpcb (default) | insert.
+    #[arg(long = "workload", default_value = "tpcb")]
+    workload: String,
+    /// Run a custom SELECT/SHOW/EXPLAIN query on every probe.
+    #[arg(long = "query")]
+    query: Option<String>,
+    /// Skip sandbox setup and cleanup. Use only with --query against
+    /// existing tables.
+    #[arg(long = "no-sandbox")]
+    no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 struct TlsArgs {
     /// host:port.
     target: String,
@@ -221,6 +252,7 @@ enum Cleanup {
         url: String,
         prefix: String,
     },
+    Postgres(postgres_bench::SandboxInfo),
 }
 
 impl Cleanup {
@@ -241,6 +273,20 @@ impl Cleanup {
                 };
                 let n = redis_bench::cleanup_sandbox(&cfg, &mut conn).await?;
                 eprintln!("databench: cleaned up {n} redis keys with prefix '{prefix}'");
+                Ok(())
+            }
+            Cleanup::Postgres(info) => {
+                postgres_bench::cleanup_sandbox(&info).await?;
+                match info.kind {
+                    postgres_bench::SandboxKind::Database => {
+                        eprintln!("databench: dropped database {}", info.db);
+                    }
+                    postgres_bench::SandboxKind::Schema => {
+                        if let Some(s) = &info.schema {
+                            eprintln!("databench: dropped schema {} from {}", s, info.db);
+                        }
+                    }
+                }
                 Ok(())
             }
         }
@@ -317,6 +363,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
             (k, d, h2, Cleanup::None)
         }
         Cmd::Redis(args) => spawn_redis(&cli, args, h.clone()).await?,
+        Cmd::Postgres(args) => spawn_postgres(&cli, args, h.clone()).await?,
     };
 
     let display = DisplayInfo {
@@ -607,6 +654,114 @@ async fn spawn_redis(
         handles,
         cleanup,
     ))
+}
+
+async fn spawn_postgres(
+    cli: &Cli,
+    args: PgArgs,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let workload = postgres_bench::PgWorkload::parse(&args.workload)?;
+
+    // Resolve a usable URL. If user gave host[:port], glue together.
+    let server_url = if args.target.contains("://") {
+        args.target.clone()
+    } else {
+        let (host, port) = if let Some((h, p)) = args.target.rsplit_once(':') {
+            let port: u16 = p.parse().with_context(|| format!("port: {p}"))?;
+            (h.to_string(), port)
+        } else {
+            (args.target.clone(), 5432u16)
+        };
+        postgres_bench::build_url(
+            &host,
+            port,
+            &args.user,
+            args.password.as_deref(),
+            &args.db,
+        )
+    };
+
+    let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+
+    let (sandbox_info, cleanup) = if args.no_sandbox {
+        // Run against the user's database and schema directly. Custom
+        // queries usually go this way.
+        let info = postgres_bench::SandboxInfo {
+            kind: postgres_bench::SandboxKind::Schema,
+            db: args.db.clone(),
+            schema: None,
+            server_url: server_url.clone(),
+        };
+        (info, Cleanup::None)
+    } else {
+        eprintln!("databench: setting up postgres sandbox (scale={}) ...", args.scale);
+        let info = postgres_bench::setup_sandbox(&server_url, &args.db, &run_id).await?;
+        // Seed only when not running a custom query.
+        if args.query.is_none() {
+            let url = postgres_bench::worker_url(&info);
+            let client = postgres_bench::connect(&url).await?;
+            postgres_bench::populate(&client, args.scale).await?;
+        }
+        let cleanup = Cleanup::Postgres(info.clone());
+        (info, cleanup)
+    };
+
+    let cfg = Arc::new(postgres_bench::PgConfig {
+        server_url: postgres_bench::worker_url(&sandbox_info),
+        sandbox_db: sandbox_info.db.clone(),
+        sandbox_schema: sandbox_info.schema.clone(),
+        workload,
+        scale: args.scale,
+        timeout: cli.timeout,
+        custom_query: args.query.clone(),
+    });
+
+    let handles = postgres_bench::spawn_workers(cfg.clone(), cli.connections, h);
+
+    let target_label = format!("{}{}",
+        match (&sandbox_info.kind, &sandbox_info.schema) {
+            (postgres_bench::SandboxKind::Database, _) => format!("postgres://.../{}", sandbox_info.db),
+            (postgres_bench::SandboxKind::Schema, Some(s)) => {
+                format!("postgres://.../{}#{}", sandbox_info.db, s)
+            }
+            _ => format!("postgres://.../{}", sandbox_info.db),
+        },
+        ""
+    );
+    let detail = match (&args.query, args.no_sandbox) {
+        (Some(q), _) => format!("custom query=\"{}\"", truncate(q, 60)),
+        (None, true) => format!("workload={}  no-sandbox", args.workload),
+        (None, false) => format!("workload={}  scale={}", args.workload, args.scale),
+    };
+
+    Ok((
+        BenchKind::Postgres,
+        DisplayInfo {
+            kind: BenchKind::Postgres,
+            target: target_label,
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+        cleanup,
+    ))
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let mut out: String = s.chars().take(max).collect();
+        out.push('…');
+        out
+    }
 }
 
 /// Strip user:password from a URL-form target so it never lands on stdout.

@@ -32,6 +32,9 @@ socket2 = "0.6"
 rand = { version = "0.8", features = ["small_rng"] }
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "tokio-rustls-comp"] }
 uuid = { version = "1", features = ["v4", "fast-rng"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+futures-util = "0.3"
 
 [profile.release]
 opt-level = 3
