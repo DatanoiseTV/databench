@@ -1,4 +1,33 @@
+# build
 /target
 Cargo.lock.bak
+
+# secrets / TLS material — defence in depth, in case someone drops a
+# .env or a real cert next to the repo. databench reads passwords from
+# DATABENCH_*_PASSWORD env vars; never commit a .env with real values.
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+credentials*
+
+# editor / OS / scratch
 *.swp
+*.swo
+*.rs.bk
+*~
+.#*
 .DS_Store
+._*
+.idea/
+.vscode/
+
+# profiling / coverage / one-off output
+flamegraph.svg
+perf.data
+perf.data.old
+*.profraw
+tarpaulin-report.html
