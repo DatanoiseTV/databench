@@ -337,11 +337,10 @@ impl WorkerReport {
         }
     }
 
-    /// Record a successful op with its label, e.g. "GET" or "tpcb-update".
-    /// Bumps both the per-op histogram and the global `total` histogram so
-    /// the dashboard's primary latency line still aggregates everything.
-    /// Also feeds the slow-queries top-N so outliers surface in the final
-    /// report.
+    /// Record one statement / op of a single-statement transaction.
+    /// Use this when the bench's natural unit *is* the operation
+    /// (Redis GET, memcache get, ICMP ping). Bumps the per-op histogram,
+    /// the `total` histogram, the slowest top-N, and the request count.
     pub fn record_op(&mut self, op: &str, total_us: u64) {
         record_us(&mut self.total, total_us);
         let h = self
@@ -350,6 +349,29 @@ impl WorkerReport {
             .or_insert_with(new_hist);
         record_us(h, total_us);
         self.slowest.record(op, total_us);
+        self.requests += 1;
+    }
+
+    /// Record a multi-statement transaction. Each `(op, us)` updates its
+    /// per-op histogram and is a candidate for the slowest top-N, but
+    /// the request count and the `total` histogram are bumped exactly
+    /// once per transaction (with `total_us = sum of ops`). This keeps
+    /// "txns/sec" honest for SQL benches where one txn is many round
+    /// trips.
+    pub fn record_txn(&mut self, ops: &[(String, u64)]) {
+        if ops.is_empty() {
+            return;
+        }
+        let total_us: u64 = ops.iter().map(|(_, us)| *us).sum();
+        record_us(&mut self.total, total_us);
+        for (op, us) in ops {
+            let h = self
+                .per_op
+                .entry(op.clone())
+                .or_insert_with(new_hist);
+            record_us(h, *us);
+            self.slowest.record(op, *us);
+        }
         self.requests += 1;
     }
 

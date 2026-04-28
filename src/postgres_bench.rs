@@ -496,28 +496,10 @@ async fn run_worker(cfg: Arc<PgConfig>, h: WorkerHandles, worker_idx: u64) -> Wo
         }
         match result {
             Ok(ops) => {
-                for (op, us) in &ops {
-                    report.record_op(op, *us);
-                }
-                // The "transaction" total is the sum of statement timings,
-                // recorded as a single global total bump so RPS reflects
-                // *transactions per second* rather than statements/sec.
                 let total_us: u64 = ops.iter().map(|(_, us)| *us).sum();
-                if !ops.is_empty() {
-                    // record_op already bumped requests + total per statement;
-                    // undo the duplicate count by replacing with one bump.
-                    // (In practice we want statements counted in per_op but
-                    // requests/sec to reflect transactions.)
-                    // For simplicity we just emit the combined RPS via the
-                    // record-op flow: leave it, because per_op count is
-                    // accurate per statement already.
-                }
-                let _ = total_us;
+                report.record_txn(&ops);
                 h.live.requests.fetch_add(1, Ordering::Relaxed);
-                h.live.record_request_phases(
-                    ops.iter().map(|(_, us)| *us).sum::<u64>(),
-                    0,
-                );
+                h.live.record_request_phases(total_us, 0);
             }
             Err(e) => {
                 report.record_error(&h.live, &format!("postgres: {}", e));

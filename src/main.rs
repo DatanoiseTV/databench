@@ -22,6 +22,8 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::task::JoinHandle;
 
 mod dns_bench;
+mod memcache_bench;
+mod mysql_bench;
 mod ping_bench;
 mod postgres_bench;
 mod ratelimit;
@@ -99,6 +101,10 @@ enum Cmd {
     Redis(RedisArgs),
     /// PostgreSQL benchmark (TPC-B-lite by default; `--query` for custom).
     Postgres(PgArgs),
+    /// memcached benchmark (memtier-canonical defaults).
+    Memcache(McArgs),
+    /// MySQL/MariaDB benchmark (sysbench OLTP-shaped).
+    Mysql(MyArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -194,6 +200,58 @@ struct RedisArgs {
 }
 
 #[derive(Args, Debug, Clone)]
+struct MyArgs {
+    /// host[:port]; default port 3306.
+    target: String,
+    /// Database to connect to / fall back into. Sandbox is created
+    /// outside this when permissions allow.
+    #[arg(long = "db", default_value = "mysql")]
+    db: String,
+    #[arg(long = "user", default_value = "root")]
+    user: String,
+    #[arg(long = "password", env = "DATABENCH_MYSQL_PASSWORD", hide_env_values = true)]
+    password: Option<String>,
+    /// Workload preset: point-select | read-only | oltp (default) | write-only.
+    /// `oltp` = sysbench's `oltp_read_write`, the canonical MySQL number.
+    #[arg(long = "workload", default_value = "oltp")]
+    workload: String,
+    /// Rows in `sbtest1`. Default 10k = ~2 MB, fits in any buffer pool.
+    /// Set --table-size 1000000+ to push past the buffer pool.
+    #[arg(long = "table-size", default_value_t = 10_000)]
+    table_size: i64,
+    /// Run a custom query on every probe. No allow-list; user owns it.
+    #[arg(long = "query")]
+    query: Option<String>,
+    /// Skip sandbox setup and cleanup.
+    #[arg(long = "no-sandbox")]
+    no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct McArgs {
+    /// host[:port]; default port 11211.
+    target: String,
+    /// Workload preset: read | memtier (default) | mixed | write.
+    #[arg(long = "workload", default_value = "memtier")]
+    workload: String,
+    /// Number of keys to seed.
+    #[arg(long = "seed-keys", default_value_t = 100_000)]
+    seed_keys: usize,
+    /// Value size (bytes) for seeded keys. 32 = memtier_benchmark default.
+    #[arg(long = "seed-value-size", default_value_t = 32)]
+    seed_value_size: usize,
+    /// TTL on every seeded key (seconds).
+    #[arg(long = "seed-ttl", default_value_t = 600)]
+    seed_ttl: u32,
+    /// Run a custom `get <key>` or `delete <key>` on every probe.
+    #[arg(long = "cmd")]
+    cmd: Option<String>,
+    /// Skip sandbox setup and cleanup.
+    #[arg(long = "no-sandbox")]
+    no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
 struct PgArgs {
     /// Connection target: full `postgresql://user:pass@host:port/db` URL,
     /// or just `host[:port]`.
@@ -263,6 +321,8 @@ enum Cleanup {
         prefix: String,
     },
     Postgres(postgres_bench::SandboxInfo),
+    Memcache(memcache_bench::McConfig),
+    Mysql(mysql_bench::SandboxInfo),
 }
 
 impl Cleanup {
@@ -296,6 +356,21 @@ impl Cleanup {
                             eprintln!("databench: dropped schema {} from {}", s, info.db);
                         }
                     }
+                }
+                Ok(())
+            }
+            Cleanup::Memcache(cfg) => {
+                let n = memcache_bench::cleanup_sandbox(&cfg).await?;
+                eprintln!(
+                    "databench: deleted {n} memcache keys with prefix '{}'",
+                    cfg.prefix
+                );
+                Ok(())
+            }
+            Cleanup::Mysql(info) => {
+                mysql_bench::cleanup_sandbox(&info).await?;
+                if matches!(info.kind, mysql_bench::SandboxKind::Database) {
+                    eprintln!("databench: dropped database `{}`", info.db);
                 }
                 Ok(())
             }
@@ -393,6 +468,8 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         }
         Cmd::Redis(args) => spawn_redis(&cli, args, h.clone()).await?,
         Cmd::Postgres(args) => spawn_postgres(&cli, args, h.clone()).await?,
+        Cmd::Memcache(args) => spawn_memcache(&cli, args, h.clone()).await?,
+        Cmd::Mysql(args) => spawn_mysql(&cli, args, h.clone()).await?,
     };
 
     let display = DisplayInfo {
@@ -686,6 +763,183 @@ async fn spawn_redis(
     ))
 }
 
+async fn spawn_mysql(
+    cli: &Cli,
+    args: MyArgs,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let (host, port) = if args.target.contains(':') {
+        parse_host_port(&args.target)?
+    } else {
+        (args.target.clone(), 3306u16)
+    };
+    let workload = mysql_bench::MyWorkload::parse(&args.workload)?;
+    let admin_opts = mysql_bench::build_opts(
+        &host,
+        port,
+        &args.user,
+        args.password.as_deref(),
+        Some(&args.db),
+    );
+
+    let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+
+    let (info, cleanup) = if args.no_sandbox {
+        (
+            mysql_bench::SandboxInfo {
+                kind: mysql_bench::SandboxKind::None,
+                admin_opts: admin_opts.clone(),
+                db: args.db.clone(),
+            },
+            Cleanup::None,
+        )
+    } else {
+        eprintln!(
+            "databench: setting up mysql sandbox (table_size={}) ...",
+            args.table_size
+        );
+        let info =
+            mysql_bench::setup_sandbox(admin_opts.clone(), &args.db, &run_id).await?;
+        if args.query.is_none() {
+            let worker_opts = mysql_bench::build_opts(
+                &host,
+                port,
+                &args.user,
+                args.password.as_deref(),
+                Some(&info.db),
+            );
+            mysql_bench::populate(worker_opts, args.table_size).await?;
+        }
+        let cleanup = match info.kind {
+            mysql_bench::SandboxKind::Database => Cleanup::Mysql(info.clone()),
+            mysql_bench::SandboxKind::None => Cleanup::None,
+        };
+        (info, cleanup)
+    };
+
+    let worker_opts = mysql_bench::build_opts(
+        &host,
+        port,
+        &args.user,
+        args.password.as_deref(),
+        Some(&info.db),
+    );
+    let cfg = Arc::new(mysql_bench::MyConfig {
+        opts: worker_opts,
+        sandbox_db: info.db.clone(),
+        sandbox_kind: info.kind,
+        workload,
+        table_size: args.table_size,
+        timeout: cli.timeout,
+        custom_query: args.query.clone(),
+    });
+
+    let handles = mysql_bench::spawn_workers(cfg.clone(), cli.connections, h);
+    let detail = match (&args.query, args.no_sandbox) {
+        (Some(q), _) => format!("custom query=\"{}\"", truncate(q, 60)),
+        (None, true) => format!("workload={}  no-sandbox", args.workload),
+        (None, false) => format!(
+            "workload={}  table_size={}",
+            args.workload, args.table_size
+        ),
+    };
+
+    Ok((
+        BenchKind::Mysql,
+        DisplayInfo {
+            kind: BenchKind::Mysql,
+            target: format!("mysql://{host}:{port}/{}", info.db),
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+        cleanup,
+    ))
+}
+
+async fn spawn_memcache(
+    cli: &Cli,
+    args: McArgs,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let (host, port) = if args.target.contains(':') {
+        parse_host_port(&args.target)?
+    } else {
+        (args.target.clone(), 11211)
+    };
+    let workload = memcache_bench::McWorkload::parse(&args.workload)?;
+
+    let run_id = uuid::Uuid::new_v4().simple().to_string()[..8].to_string();
+    let prefix = format!("databench:{run_id}:");
+
+    let cfg = memcache_bench::McConfig {
+        host: host.clone(),
+        port,
+        prefix: prefix.clone(),
+        workload,
+        seed_keys: args.seed_keys,
+        seed_value_size: args.seed_value_size,
+        seed_ttl: args.seed_ttl,
+        timeout: cli.timeout,
+        custom: args.cmd.clone(),
+    };
+
+    // Smoke test + sandbox.
+    let mut client = memcache_bench::McClient::connect(&host, port)
+        .await
+        .with_context(|| format!("connect memcached {host}:{port}"))?;
+    let version = client.version().await.unwrap_or_else(|_| "unknown".into());
+    let cleanup = if !args.no_sandbox && args.cmd.is_none() {
+        eprintln!(
+            "databench: seeding {} memcache keys (prefix={}, value_size={}B) ...",
+            args.seed_keys, prefix, args.seed_value_size
+        );
+        memcache_bench::setup_sandbox(&cfg, &mut client)
+            .await
+            .context("seeding memcache sandbox")?;
+        Cleanup::Memcache(cfg.clone())
+    } else {
+        Cleanup::None
+    };
+    drop(client);
+
+    let arc_cfg = Arc::new(cfg);
+    let handles = memcache_bench::spawn_workers(arc_cfg.clone(), cli.connections, h);
+
+    let detail = match (&args.cmd, args.no_sandbox) {
+        (Some(c), _) => format!("custom cmd=\"{}\"  v={}", truncate(c, 50), version),
+        (None, true) => format!("workload={}  no-sandbox  v={}", args.workload, version),
+        (None, false) => format!(
+            "workload={}  seed_keys={}  v={}",
+            args.workload, args.seed_keys, version
+        ),
+    };
+
+    Ok((
+        BenchKind::Memcache,
+        DisplayInfo {
+            kind: BenchKind::Memcache,
+            target: format!("memcached://{host}:{port}"),
+            detail,
+            threads: 0,
+            connections: cli.connections,
+        },
+        handles,
+        cleanup,
+    ))
+}
+
 async fn spawn_postgres(
     cli: &Cli,
     args: PgArgs,
@@ -697,6 +951,25 @@ async fn spawn_postgres(
     Cleanup,
 )> {
     let workload = postgres_bench::PgWorkload::parse(&args.workload)?;
+
+    // pgbench's well-known guidance: when `scale < clients`, every worker
+    // contends on the same handful of branches/tellers rows and you end
+    // up measuring lock contention rather than the database. Refuse the
+    // run with a clear message instead of silently publishing a
+    // misleading number.
+    if args.query.is_none()
+        && !args.no_sandbox
+        && matches!(workload, postgres_bench::PgWorkload::Tpcb)
+        && (args.scale as usize) < cli.connections
+    {
+        bail!(
+            "pgbench TPC-B contends badly when scale ({}) < connections ({}). \
+             Bump --scale to at least {} or pick `--workload select-only`.",
+            args.scale,
+            cli.connections,
+            cli.connections
+        );
+    }
 
     // Resolve a usable URL. If user gave host[:port], glue together.
     let server_url = if args.target.contains("://") {
