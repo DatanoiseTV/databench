@@ -8,8 +8,8 @@ so when your numbers regress you can see *where* they regressed.
 
 ## Highlights
 
-- **Ten modes** so far: `http`, `ping`, `tcp`, `dns`, `tls`, `redis`,
-  `memcache`, `postgres`, `mysql`, `s3`.
+- **Eleven modes** so far: `http`, `ping`, `tcp`, `dns`, `tls`, `redis`,
+  `memcache`, `postgres`, `mysql`, `s3`, `tinyice`.
 - **Real-world workloads** for the database modes — not toy `SELECT 1`s:
   - Redis / memcached default to `memtier_benchmark`'s 1:10 SET:GET on
     32-byte values (the canonical published "ops/sec" shape).
@@ -20,6 +20,9 @@ so when your numbers regress you can see *where* they regressed.
     per transaction).
   - S3 / MinIO defaults to `warp`'s mixed mix (45% GET, 30% STAT,
     15% PUT, 10% DELETE).
+  - TinyIce / Icecast2 streams a real linear-chirp MP3 (200 Hz → 8 kHz
+    over 60 s, 128 kbps stereo) so the wire data is a well-formed MPEG
+    audio stream and the benchmark exercises an actual broadcaster.
 - **Sandbox by default** — every database mode creates a unique
   `databench_<runid>` namespace, populates it, runs the workload there,
   and cleans up at the end. `Ctrl-C` is honoured. Cleanup refuses to
@@ -212,6 +215,56 @@ refuses to touch any bucket whose name doesn't start with `databench-`.
     DATABENCH_S3_ACCESS_KEY=... DATABENCH_S3_SECRET_KEY=... \
         databench -c 32 -z 60s s3 https://s3.us-east-1.amazonaws.com \
         --region us-east-1
+
+### tinyice
+
+Icecast2 streaming benchmark, modelled after how a TinyIce / Icecast2
+server actually gets used: many listener clients pulling a stream from
+a mount, sources pushing audio in.
+
+Three modes:
+
+- **listen** — `-c` workers do `GET /<mount>` against the server,
+  drain bytes forever, count drops. Answers "how many concurrent
+  listeners can the server hold?". Round-robins workers across
+  `--mounts a,b,c`.
+- **source** — `--sources` workers (or `-c` if not set) open
+  `SOURCE /<mount>` with HTTP Basic auth, push the embedded chirp MP3
+  paced at 128 kbps. Each worker takes one mount round-robin.
+  Records source-connect handshake time.
+- **mixed**  — sources start first (with a small grace period), then
+  `-c` listener workers fan out across the mounts. The realistic
+  radio-station shape.
+
+```sh
+# listen-only against a public stream — fan out 1000 listeners on /live
+databench -c 1000 -z 60s tinyice https://radio.example.com --mounts /live
+
+# push to a single mount with the source password
+DATABENCH_TINYICE_PASSWORD=secret \
+  databench -c 1 -z 30s tinyice https://radio.example.com \
+  --mode source --mounts /live
+
+# end-to-end: 1 source feeding 50 listeners across 3 mounts
+DATABENCH_TINYICE_PASSWORD=secret \
+  databench -c 50 -z 60s tinyice https://radio.example.com \
+  --mode mixed --sources 3 --mounts /live,/chill,/talk
+```
+
+`tinyice` flags: `--mode {listen|source|mixed}`, `--mounts <list>`
+(comma-separated), `--source-user`, `--source-password` (or env
+`DATABENCH_TINYICE_PASSWORD`), `--source-bitrate`, `--sources`,
+`-k/--insecure` (TLS verify off). Both `http://` and `https://`
+endpoints are supported. The `connections` live counter is repurposed
+for tinyice as **currently-connected listeners + sources** so the
+dashboard reflects what an operator cares about. Per-op latency table
+shows `listen-connect` (TCP+TLS+HTTP+TTFB to first audio byte) and
+`source-connect` (TCP+TLS+HTTP SOURCE + auth) separately.
+
+The source mode embeds a 60-second linear-chirp MP3 (200 Hz → 8 kHz at
+128 kbps). The 60 s period was picked so that a future FFT-based
+listener can map an observed pitch back to a unique source emission
+time even when the listener catches up via the server's burst buffer.
 
 `s3` flags: `--access-key`, `--secret-key` (or `DATABENCH_S3_*` env),
 `--region`, `--workload {read|mixed|write|stat}`, `--object-size`,

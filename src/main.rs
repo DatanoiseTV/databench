@@ -31,6 +31,7 @@ mod redis_bench;
 mod s3_bench;
 mod stats;
 mod tcp_bench;
+mod tinyice_bench;
 mod tls;
 mod tls_bench;
 mod worker;
@@ -108,6 +109,8 @@ enum Cmd {
     Mysql(MyArgs),
     /// S3 / MinIO object-store benchmark (warp-shaped workloads).
     S3(S3Args),
+    /// TinyIce / Icecast2 streaming benchmark (listeners, sources, mixed).
+    Tinyice(TinyIceArgs),
 }
 
 #[derive(Args, Debug, Clone)]
@@ -200,6 +203,37 @@ struct RedisArgs {
     /// against an existing dataset.
     #[arg(long = "no-sandbox")]
     no_sandbox: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+struct TinyIceArgs {
+    /// Server URL — http://host[:port] or https://host[:port].
+    endpoint: String,
+    /// Mode: listen | source | mixed (default `listen`).
+    #[arg(long = "mode", default_value = "listen")]
+    mode: String,
+    /// Mount points (comma-separated). Workers round-robin across them.
+    /// Default `/live`.
+    #[arg(long = "mounts", default_value = "/live", value_delimiter = ',')]
+    mounts: Vec<String>,
+    /// Username for SOURCE auth. Icecast usually accepts an empty user.
+    #[arg(long = "source-user", default_value = "source")]
+    source_user: String,
+    /// Source password (or default source password). Required for source
+    /// and mixed modes.
+    #[arg(long = "source-password", env = "DATABENCH_TINYICE_PASSWORD", hide_env_values = true)]
+    source_password: Option<String>,
+    /// Bitrate (kbps) — used to pace `SOURCE` writes so they don't blast
+    /// data faster than a real broadcaster.
+    #[arg(long = "source-bitrate", default_value_t = 128)]
+    source_bitrate: u32,
+    /// Number of source workers in `source` and `mixed` modes. In `listen`
+    /// mode this is ignored — `-c` controls the listener count.
+    #[arg(long = "sources", default_value_t = 1)]
+    sources: usize,
+    /// Skip TLS certificate verification. DANGEROUS — testing only.
+    #[arg(short = 'k', long = "insecure")]
+    insecure: bool,
 }
 
 #[derive(Args, Debug, Clone)]
@@ -530,6 +564,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         Cmd::Memcache(args) => spawn_memcache(&cli, args, h.clone()).await?,
         Cmd::Mysql(args) => spawn_mysql(&cli, args, h.clone()).await?,
         Cmd::S3(args) => spawn_s3(&cli, args, h.clone()).await?,
+        Cmd::Tinyice(args) => spawn_tinyice(&cli, args, h.clone())?,
     };
 
     let display = DisplayInfo {
@@ -607,6 +642,7 @@ async fn async_main(cli: Cli, threads: usize) -> Result<()> {
         BenchKind::Mysql => "MySQL wire",
         BenchKind::Memcache => "memcached text",
         BenchKind::S3 => "S3 / HTTPS",
+        BenchKind::TinyIce => "Icecast2",
     };
     let protocol = proto_observed.lock().unwrap_or(default_proto);
     let final_report =
@@ -839,6 +875,133 @@ async fn spawn_redis(
         },
         handles,
         cleanup,
+    ))
+}
+
+fn spawn_tinyice(
+    cli: &Cli,
+    args: TinyIceArgs,
+    h: WorkerHandles,
+) -> Result<(
+    BenchKind,
+    DisplayInfo,
+    Vec<JoinHandle<WorkerReport>>,
+    Cleanup,
+)> {
+    let parsed = url::Url::parse(&args.endpoint)
+        .with_context(|| format!("invalid URL: {}", args.endpoint))?;
+    let use_tls = match parsed.scheme() {
+        "http" => false,
+        "https" => true,
+        other => bail!("unsupported scheme '{other}' (expected http or https)"),
+    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| anyhow!("URL must have a host"))?
+        .to_string();
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| anyhow!("unable to determine port"))?;
+
+    let mode = tinyice_bench::TinyIceMode::parse(&args.mode)?;
+    let mounts: Vec<String> = args
+        .mounts
+        .iter()
+        .map(|m| {
+            if m.starts_with('/') {
+                m.clone()
+            } else {
+                format!("/{}", m)
+            }
+        })
+        .collect();
+    if mounts.is_empty() {
+        bail!("--mounts must list at least one mount");
+    }
+
+    let listener_count = cli.connections;
+    let source_count = match mode {
+        tinyice_bench::TinyIceMode::Source => cli.connections,
+        tinyice_bench::TinyIceMode::Mixed => args.sources.max(1),
+        tinyice_bench::TinyIceMode::Listen => 0,
+    };
+
+    let needs_password =
+        matches!(mode, tinyice_bench::TinyIceMode::Source | tinyice_bench::TinyIceMode::Mixed);
+    let source_password = match (needs_password, args.source_password.as_deref()) {
+        (true, Some(p)) => p.to_string(),
+        (true, None) => bail!(
+            "source/mixed modes need --source-password (or DATABENCH_TINYICE_PASSWORD)"
+        ),
+        _ => String::new(),
+    };
+
+    if matches!(mode, tinyice_bench::TinyIceMode::Source) && source_count > mounts.len() {
+        eprintln!(
+            "note: --sources ({}) > --mounts ({}); workers will round-robin and multiple sources will collide on the same mount.",
+            source_count,
+            mounts.len()
+        );
+    }
+
+    let cfg = Arc::new(tinyice_bench::TinyIceConfig {
+        host: host.clone(),
+        port,
+        use_tls,
+        insecure: args.insecure,
+        mounts: mounts.clone(),
+        mode,
+        source_user: args.source_user.clone(),
+        source_password,
+        source_bitrate_kbps: args.source_bitrate,
+        timeout: cli.timeout,
+    });
+
+    let handles = tinyice_bench::spawn(cfg.clone(), listener_count, source_count, h);
+
+    let target_label = format!(
+        "{}://{}:{}{}",
+        if use_tls { "https" } else { "http" },
+        host,
+        port,
+        if mounts.len() == 1 {
+            mounts[0].clone()
+        } else {
+            format!(" ({} mounts)", mounts.len())
+        }
+    );
+    let detail = match mode {
+        tinyice_bench::TinyIceMode::Listen => format!(
+            "mode=listen  listeners={}  mounts={}",
+            listener_count,
+            mounts.join(",")
+        ),
+        tinyice_bench::TinyIceMode::Source => format!(
+            "mode=source  sources={}  bitrate={}kbps  mounts={}",
+            source_count,
+            args.source_bitrate,
+            mounts.join(",")
+        ),
+        tinyice_bench::TinyIceMode::Mixed => format!(
+            "mode=mixed  sources={}  listeners={}  bitrate={}kbps  mounts={}",
+            source_count,
+            listener_count,
+            args.source_bitrate,
+            mounts.join(",")
+        ),
+    };
+
+    Ok((
+        BenchKind::TinyIce,
+        DisplayInfo {
+            kind: BenchKind::TinyIce,
+            target: target_label,
+            detail,
+            threads: 0,
+            connections: listener_count + source_count,
+        },
+        handles,
+        Cleanup::None,
     ))
 }
 
@@ -1703,6 +1866,9 @@ fn draw_body(
         BenchKind::Postgres | BenchKind::Mysql => {
             vec![phase_kv("Txn time      ", ttfb, Color::Yellow)]
         }
+        BenchKind::TinyIce => {
+            vec![phase_kv("Connect+TTFB  ", ttfb, Color::Yellow)]
+        }
     };
     let phases = Paragraph::new(phase_lines).block(
         Block::default()
@@ -1736,6 +1902,7 @@ fn draw_body(
         BenchKind::Ping => " pings ",
         BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => " ops ",
         BenchKind::Postgres | BenchKind::Mysql => " txns ",
+        BenchKind::TinyIce => " streams ",
         _ => " probes ",
     };
     let status = Paragraph::new(status_lines)

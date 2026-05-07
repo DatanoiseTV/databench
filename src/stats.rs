@@ -16,6 +16,7 @@ pub enum BenchKind {
     Mysql,
     Memcache,
     S3,
+    TinyIce,
 }
 
 impl BenchKind {
@@ -31,6 +32,7 @@ impl BenchKind {
             BenchKind::Mysql => "MySQL",
             BenchKind::Memcache => "memcached",
             BenchKind::S3 => "S3",
+            BenchKind::TinyIce => "TinyIce / Icecast2",
         }
     }
 
@@ -42,6 +44,7 @@ impl BenchKind {
             BenchKind::Dns => "lookup",
             BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => "op",
             BenchKind::Postgres | BenchKind::Mysql => "txn",
+            BenchKind::TinyIce => "stream",
         }
     }
 
@@ -54,6 +57,7 @@ impl BenchKind {
             BenchKind::Tls => "handshakes",
             BenchKind::Redis | BenchKind::Memcache | BenchKind::S3 => "ops",
             BenchKind::Postgres | BenchKind::Mysql => "txns",
+            BenchKind::TinyIce => "streams",
         }
     }
 }
@@ -623,6 +627,9 @@ pub fn render_final(r: &FinalReport) -> String {
         }
         BenchKind::Postgres | BenchKind::Mysql => {
             req_rows.push(("Transaction time  ", &r.total));
+        }
+        BenchKind::TinyIce => {
+            req_rows.push(("Connect time      ", &r.total));
         }
     }
     if !conn_rows.is_empty() {

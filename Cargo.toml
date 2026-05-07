@@ -39,6 +39,7 @@ mysql_async = { version = "0.34", default-features = false, features = ["minimal
 aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-smithy-types = "1"
+base64 = "0.22"
 
 [profile.release]
 opt-level = 3
