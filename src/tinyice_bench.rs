@@ -21,9 +21,12 @@
 //! decremented when the connection ends) so the dashboard reflects what an
 //! operator cares about — how many listeners are actually streaming.
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use parking_lot::Mutex;
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -86,6 +89,11 @@ pub struct TinyIceConfig {
     pub source_password: String,
     pub source_bitrate_kbps: u32,
     pub timeout: Duration,
+    /// Per-mount wall-clock instant of the source's first emitted byte —
+    /// the reference for end-to-end RTT measurement on listeners. Set by
+    /// the source worker on its first successful write; read by listener
+    /// workers to convert observed source-byte positions into emit times.
+    pub source_t0: Arc<Mutex<HashMap<String, Instant>>>,
 }
 
 pub fn spawn(
@@ -184,7 +192,8 @@ async fn listener_worker(cfg: Arc<TinyIceConfig>, idx: usize, h: WorkerHandles) 
         }
 
         // Drain forever (or until stop/disconnect).
-        let drain_res = drain_listener(&mut bs, &h, measuring).await;
+        let drain_res =
+            drain_listener(&mut bs, &h, &cfg, &mount, measuring, &mut report).await;
         if measuring {
             h.live.connections.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = drain_res {
@@ -201,9 +210,17 @@ async fn listener_worker(cfg: Arc<TinyIceConfig>, idx: usize, h: WorkerHandles) 
 async fn drain_listener(
     bs: &mut BufStream<IoStream>,
     h: &WorkerHandles,
+    cfg: &TinyIceConfig,
+    mount: &str,
     measuring: bool,
+    report: &mut WorkerReport,
 ) -> Result<()> {
     let mut buf = vec![0u8; 8192];
+    // Sliding window of recent received bytes for substring matching.
+    let window_size = 512usize;
+    let mut window: VecDeque<u8> = VecDeque::with_capacity(window_size + 8192);
+    let mut next_lag_check = Instant::now() + Duration::from_millis(500);
+
     while !h.stop.load(Ordering::Relaxed) {
         let read = h.race_stop(bs.read(&mut buf)).await;
         let n = match read {
@@ -215,8 +232,62 @@ async fn drain_listener(
         if measuring {
             h.live.bytes.fetch_add(n as u64, Ordering::Relaxed);
         }
+        // Maintain a sliding window of the most recent bytes.
+        for &b in &buf[..n] {
+            if window.len() >= window_size {
+                window.pop_front();
+            }
+            window.push_back(b);
+        }
+
+        if measuring && Instant::now() >= next_lag_check && window.len() >= window_size {
+            next_lag_check = Instant::now() + Duration::from_millis(500);
+            // Snapshot t0 for this mount. Skip RTT measurement if no
+            // source has stamped t0 yet (listener-only against a stream
+            // we don't own).
+            let t0 = cfg.source_t0.lock().get(mount).copied();
+            if let Some(t0) = t0 {
+                let pattern: Vec<u8> = window.iter().copied().collect();
+                if let Some(file_offset) = find_unique_position(SWEEP_60S_128K_MP3, &pattern) {
+                    // The MATCHED bytes are at the START of the window;
+                    // the listener has actually received `window_size`
+                    // bytes after that match (the END of the window is
+                    // the byte the listener just received), so the
+                    // observed source position is one full window past
+                    // the match offset.
+                    let observed_pos = (file_offset + window_size) as u64
+                        % SWEEP_60S_128K_MP3.len() as u64;
+                    let bytes_per_sec =
+                        cfg.source_bitrate_kbps as f64 * 1000.0 / 8.0;
+                    let elapsed_secs = t0.elapsed().as_secs_f64();
+                    let source_now_pos = ((elapsed_secs * bytes_per_sec) as u64)
+                        % SWEEP_60S_128K_MP3.len() as u64;
+                    let raw =
+                        source_now_pos as i64 - observed_pos as i64;
+                    let lag_bytes = if raw >= 0 {
+                        raw
+                    } else {
+                        raw + SWEEP_60S_128K_MP3.len() as i64
+                    } as u64;
+                    let lag_us = (lag_bytes as f64 / bytes_per_sec * 1_000_000.0) as u64;
+                    report.record_op("rtt-by-bytes", lag_us);
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Find `pattern` in `text` and return its offset only if it occurs
+/// exactly once. memchr's `Finder` jumps over byte mismatches efficiently.
+fn find_unique_position(text: &[u8], pattern: &[u8]) -> Option<usize> {
+    let finder = memchr::memmem::Finder::new(pattern);
+    let mut iter = finder.find_iter(text);
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None; // ambiguous — discard this sample
+    }
+    Some(first)
 }
 
 /// Dial a host:port — plain TCP or TLS-wrapped — and return a type-erased
@@ -333,6 +404,7 @@ async fn source_worker(cfg: Arc<TinyIceConfig>, idx: usize, h: WorkerHandles) ->
         let payload = SWEEP_60S_128K_MP3;
         let mut offset = 0usize;
         let mut next_at = Instant::now();
+        let mut first_byte_emitted = false;
         loop {
             if h.stop.load(Ordering::Relaxed) {
                 break;
@@ -354,6 +426,17 @@ async fn source_worker(cfg: Arc<TinyIceConfig>, idx: usize, h: WorkerHandles) ->
                             report.record_error(&h.live, &format!("source-flush: {}", e));
                         }
                         break;
+                    }
+                    if !first_byte_emitted {
+                        first_byte_emitted = true;
+                        // Stamp t0 = wall time when the *first* MP3 byte
+                        // for this mount went on the wire. Listeners read
+                        // this to compute end-to-end RTT by byte position.
+                        // We only set it once per mount — if a source
+                        // reconnects, we don't reset, so listener
+                        // measurements stay consistent across the run.
+                        let mut g = cfg.source_t0.lock();
+                        g.entry(mount.clone()).or_insert_with(Instant::now);
                     }
                     if measuring {
                         h.live.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);

@@ -40,6 +40,7 @@ aws-sdk-s3 = { version = "1", features = ["behavior-version-latest"] }
 aws-credential-types = "1"
 aws-smithy-types = "1"
 base64 = "0.22"
+memchr = "2"
 
 [profile.release]
 opt-level = 3

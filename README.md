@@ -262,9 +262,23 @@ shows `listen-connect` (TCP+TLS+HTTP+TTFB to first audio byte) and
 `source-connect` (TCP+TLS+HTTP SOURCE + auth) separately.
 
 The source mode embeds a 60-second linear-chirp MP3 (200 Hz → 8 kHz at
-128 kbps). The 60 s period was picked so that a future FFT-based
-listener can map an observed pitch back to a unique source emission
-time even when the listener catches up via the server's burst buffer.
+128 kbps). Because the listener can pattern-match a window of received
+bytes against the embedded file, **mixed mode also reports a real
+end-to-end RTT** as `rtt-by-bytes` in the per-op latency table:
+
+1. The first source worker stamps `t0` = wall time of the first byte
+   sent on each mount.
+2. Each listener takes a 512-byte window of recently-received bytes
+   every ~500 ms and locates it (uniquely) in the embedded sweep, which
+   gives the source byte position the listener has just observed.
+3. RTT = (where the source is now in its byte stream) − (where the
+   listener just observed) − converted to time at 128 kbps.
+
+The 60 s period exceeds typical Icecast burst depth (~32 s), so the
+mapping stays unambiguous even when a listener is consuming the
+server's burst buffer. The first reported lag will be high (whole
+burst replayed); after the burst drains, lag converges to the real
+end-to-end RTT.
 
 `s3` flags: `--access-key`, `--secret-key` (or `DATABENCH_S3_*` env),
 `--region`, `--workload {read|mixed|write|stat}`, `--object-size`,

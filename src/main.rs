@@ -955,6 +955,7 @@ fn spawn_tinyice(
         source_password,
         source_bitrate_kbps: args.source_bitrate,
         timeout: cli.timeout,
+        source_t0: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
     });
 
     let handles = tinyice_bench::spawn(cfg.clone(), listener_count, source_count, h);

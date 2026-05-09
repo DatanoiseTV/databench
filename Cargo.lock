@@ -993,6 +993,7 @@ dependencies = [
  "humantime",
  "hyper 1.9.0",
  "hyper-util",
+ "memchr",
  "mysql_async",
  "num_cpus",
  "parking_lot",
